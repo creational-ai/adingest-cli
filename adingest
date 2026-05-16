@@ -1,0 +1,769 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "httpx>=0.27",
+#   "rich>=13.0",
+#   "click>=8.1",
+# ]
+# ///
+"""adingest — project-agnostic CLI for the ad-ingest service.
+
+NO imports of ``ad_ingest.*`` — HTTP only. Three subcommands (``ingest``,
+``range``, ``status``) render the 9-counter wire contract (5 row + 4 GA4)
+per source through an 8-category verdict classifier as a ``rich`` table.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, ClassVar, Literal
+
+import click
+import httpx
+from rich.console import Console
+from rich.table import Table
+
+# --- Module constants -------------------------------------------------------
+
+#: CLI version placeholder. ``/deploy`` Phase 1a bakes the real ``X.Y.Z``
+#: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
+#: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
+#: which copy is running.
+__version__ = "0.1.0"
+
+#: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
+#: env. Step 4's ``upgrade`` subcommand compares this against the service
+#: manifest's ``product`` field: a mismatch means the operator pointed the
+#: CLI at a different Creational product's server and the upgrade is refused.
+PRODUCT = "adingest"
+
+# --- Config -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdingestConfig:
+    """Caller-side configuration; frozen so flag overrides go through ``replace``."""
+    url: str = "http://localhost:8000"
+    token: str = ""
+    apps: list[dict[str, Any]] = field(default_factory=list)
+    lp_secret_key: str = ""
+    lp_refresh_token: str = ""
+    bq_project_id: str = ""
+    bq_dataset: str = ""
+    bq_sa_key_path: str = ""
+
+    @classmethod
+    def from_env(cls) -> AdingestConfig:
+        apps_raw = os.environ.get("APPS_JSON", "[]")
+        try:
+            apps = json.loads(apps_raw) if apps_raw else []
+        except json.JSONDecodeError:
+            apps = []
+        return cls(
+            url=os.environ.get("INGEST_API_URL", "http://localhost:8000"),
+            token=os.environ.get("INGEST_API_TOKEN", ""),
+            apps=apps,
+            lp_secret_key=os.environ.get("LP_SECRET_KEY", ""),
+            lp_refresh_token=os.environ.get("LP_REFRESH_TOKEN", ""),
+            bq_project_id=os.environ.get("BQ_TEST_PROJECT_ID", ""),
+            bq_dataset=os.environ.get("BQ_TEST_DATASET", ""),
+            bq_sa_key_path=os.environ.get("BQ_TEST_SA_KEY_PATH", ""),
+        )
+
+
+def _load_env_client(cwd: Path | None = None) -> None:
+    """Source ``.env.client`` from CWD if present (``KEY=value`` lines, ``#`` comments)."""
+    path = (cwd or Path.cwd()) / ".env.client"
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+# --- HTTP client ------------------------------------------------------------
+
+
+class AdingestClient:
+    """HTTP client speaking the ad-ingest wire contract (``/v1/`` + ``/v1/jobs/{id}``)."""
+
+    def __init__(
+        self, config: AdingestConfig, transport: httpx.BaseTransport | None = None
+    ) -> None:
+        self.config = config
+        self._client = httpx.Client(
+            base_url=config.url,
+            headers={"Authorization": f"Bearer {config.token}"},
+            timeout=30.0,
+            transport=transport,
+        )
+
+    def post_ingest(
+        self, event_date: str, source: str, apps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return self._request("POST", "/v1/", json=self._build_body(event_date, source, apps))
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/jobs/{job_id}")
+
+    def _request(self, method: str, path: str, **kw: Any) -> dict[str, Any]:
+        """Send one HTTP request; convert httpx errors to click.ClickException so
+        operators see a one-line classified failure (e.g.,
+        ``Error: HTTP 422 POST /v1/ — invalid event_date``) instead of a raw
+        Python traceback."""
+        try:
+            resp = self._client.request(method, path, **kw)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                body = e.response.json()
+                detail = body.get("detail") or body.get("title") or ""
+            except (json.JSONDecodeError, ValueError):
+                detail = e.response.text[:200].strip()
+            msg = f"HTTP {e.response.status_code} {method} {path}"
+            raise click.ClickException(f"{msg} — {detail}" if detail else msg) from None
+        except httpx.RequestError as e:
+            raise click.ClickException(
+                f"network error {type(e).__name__}: {e} (is the service running at {self.config.url}?)"
+            ) from None
+        return resp.json()  # type: ignore[no-any-return]
+
+    def poll_until_terminal(
+        self, job_id: str, interval: float = 2.0, max_wait: float = 120.0
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + max_wait
+        while True:
+            body = self.get_job(job_id)
+            if body.get("status") in ("complete", "partial", "failed"):
+                return body
+            if time.monotonic() >= deadline:
+                return body
+            time.sleep(interval)
+
+    def _build_body(
+        self, event_date: str, source: str, apps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if source == "stub":
+            sources_block: dict[str, Any] = {"stub_ok": {"value": "stub"}}
+        elif source == "levelplay":
+            sources_block = {"levelplay": {
+                "secret_key": self.config.lp_secret_key,
+                "refresh_token": self.config.lp_refresh_token,
+            }}
+        else:
+            raise click.UsageError(f"Unknown source: {source!r} (expected 'levelplay' or 'stub')")
+        sa_key: dict[str, Any] = {}
+        if self.config.bq_sa_key_path and Path(self.config.bq_sa_key_path).exists():
+            sa_key = json.loads(Path(self.config.bq_sa_key_path).read_text())
+        return {
+            "event_date": event_date,
+            "apps": apps,
+            "sources": sources_block,
+            "destinations": {"bigquery": {
+                "project_id": self.config.bq_project_id,
+                "dataset": self.config.bq_dataset,
+                "sa_key": sa_key,
+            }},
+        }
+
+
+# --- Verdict classifier -----------------------------------------------------
+
+
+class VerdictClassifier:
+    """Maps per-source counters to ordered verdict slugs (precedence-ranked).
+
+    Precedence: tier ``🚨 > ⚠️ > ✅``; within a tier, the lower table index wins.
+    ``classify`` returns the full ordered triggered list (pre-precedence) so
+    ``--json`` consumers see every match; rendering picks index 0.
+    """
+
+    # Table order encodes within-tier precedence. (slug, emoji).
+    VERDICTS: tuple[tuple[str, str], ...] = (
+        ("healthy-fresh", "✅"),
+        ("healthy-dedup", "✅"),
+        ("partial-dedup", "⚠️"),
+        ("empty-upstream", "🚨"),
+        ("invalid-heavy", "🚨"),
+        ("writer-orphan-heavy", "🚨"),
+        ("ga4-orphan-heavy", "🚨"),
+        ("silent-drop", "🚨"),
+    )
+    TIER_RANK: ClassVar[dict[str, int]] = {"🚨": 0, "⚠️": 1, "✅": 2}
+
+    @classmethod
+    def classify(cls, source: dict[str, Any]) -> list[str]:
+        f = int(source.get("rows_fetched", 0))
+        inv = int(source.get("rows_invalid", 0))
+        d = int(source.get("rows_skipped_dedup", 0))
+        i = int(source.get("rows_inserted", 0))
+        o = int(source.get("rows_inserted_orphan", 0))
+        ga = int(source.get("ga4_events_attempted", 0))
+        go = int(source.get("ga4_events_skipped_orphan", 0))
+        triggers: list[int] = []
+        if f > 0 and i == (f - inv) and d == 0:
+            triggers.append(0)
+        if f > 0 and d == (f - inv) and i == 0:
+            triggers.append(1)
+        if f > 0 and i > 0 and d > 0:
+            triggers.append(2)
+        if f == 0:
+            triggers.append(3)
+        if f > 0 and inv > 0.05 * f:
+            triggers.append(4)
+        if i > 0 and (o / i) > 0.5:
+            triggers.append(5)
+        if ga > 0 and (go / ga) > 0.5:
+            triggers.append(6)
+        if i < (f - inv - d):
+            triggers.append(7)
+        triggers.sort(key=lambda t: (cls.TIER_RANK[cls.VERDICTS[t][1]], t))
+        return [cls.VERDICTS[t][0] for t in triggers]
+
+    @classmethod
+    def display(cls, slugs: list[str]) -> str:
+        if not slugs:
+            return ""
+        emoji = next(em for slug, em in cls.VERDICTS if slug == slugs[0])
+        return f"{emoji} {slugs[0]}"
+
+
+# --- Renderer ---------------------------------------------------------------
+
+
+def _format_uid_pct(inserted: int, orphan: int) -> str:
+    """Render ``%uid``: ``—`` when zero inserted; ``ERR`` on orphan>inserted invariant violation."""
+    if inserted == 0:
+        return "—"
+    if orphan > inserted:
+        return "ERR"
+    return f"{((inserted - orphan) / inserted) * 100:.1f}%"
+
+
+class TableRenderer:
+    """Renders a job-status response as verdict-annotated rich table(s)."""
+
+    COLS = ("Key", "fetched", "invalid", "skipped_dedup", "inserted", "orphan", "%uid", "verdict")
+
+    def __init__(self, console: Console | None = None) -> None:
+        self.console = console or Console()
+
+    def render(self, response: dict[str, Any]) -> None:
+        job_id = response.get("job_id", "?")
+        status = response.get("status", "?")
+        dur = self._duration(response)
+        self.console.print(f"Job {job_id}  status={status}  {dur}".rstrip())
+        for source_name, source in response.get("sources", {}).items():
+            self._render_source(source_name, source)
+        for err in response.get("errors") or []:
+            self.console.print(f"[red]error:[/red] {err}")
+
+    def _render_source(self, source_name: str, source: dict[str, Any]) -> None:
+        self.console.print(f"Source: {source_name}")
+        by_app = source.get("by_app_platform", {})
+        table = Table(show_header=True, header_style="bold")
+        for col in self.COLS:
+            table.add_column(col)
+        # Single-app collapse: omit per-app rows when only one app present.
+        if len(by_app) > 1:
+            for key, app in by_app.items():
+                ins = int(app.get("rows_inserted", 0))
+                orp = int(app.get("rows_inserted_orphan", 0))
+                slugs = VerdictClassifier.classify({**source, **app})
+                table.add_row(key, "⋯", "⋯", "⋯", str(ins), str(orp),
+                              _format_uid_pct(ins, orp), VerdictClassifier.display(slugs))
+            table.add_section()
+        ins = int(source.get("rows_inserted", 0))
+        orp = int(source.get("rows_inserted_orphan", 0))
+        slugs = VerdictClassifier.classify(source)
+        table.add_row(
+            "source total",
+            str(source.get("rows_fetched", 0)),
+            str(source.get("rows_invalid", 0)),
+            str(source.get("rows_skipped_dedup", 0)),
+            str(ins), str(orp),
+            _format_uid_pct(ins, orp),
+            VerdictClassifier.display(slugs),
+        )
+        self.console.print(table)
+        self.console.print(
+            f"GA4: attempted={source.get('ga4_events_attempted', 0)}  "
+            f"sent={source.get('ga4_events_sent', 0)}  "
+            f"skipped_orphan={source.get('ga4_events_skipped_orphan', 0)}  "
+            f"failed={source.get('ga4_events_failed', 0)}"
+        )
+
+    @staticmethod
+    def _duration(response: dict[str, Any]) -> str:
+        started, completed = response.get("started_at"), response.get("completed_at")
+        if not started or not completed:
+            return ""
+        try:
+            t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+            return f"{(t1 - t0).total_seconds():.1f}s"
+        except (ValueError, AttributeError):
+            return ""
+
+
+def _merge_verdicts_into_response(response: dict[str, Any]) -> dict[str, Any]:
+    """Return ``response`` with ``verdicts: [...]`` injected at every row scope."""
+    out: dict[str, Any] = json.loads(json.dumps(response))  # deep copy via JSON round-trip
+    for source in out.get("sources", {}).values():
+        source["verdicts"] = VerdictClassifier.classify(source)
+        for app in source.get("by_app_platform", {}).values():
+            app["verdicts"] = VerdictClassifier.classify({**source, **app})
+    return out
+
+
+# --- Upgrade flow -----------------------------------------------------------
+
+
+#: Verdict slug emitted by :meth:`UpgradeFlow.compute_verdict` — one of four
+#: branches. Only ``"older-required"`` proceeds past step 4 of the 9-step flow;
+#: the other three exit cleanly at step 4 with an informational message.
+UpgradeVerdict = Literal["equal", "local-newer", "older-compatible", "older-required"]
+
+
+@dataclass(frozen=True)
+class CliVersionManifest:
+    """Frozen mirror of the service's ``CliVersionManifest`` Pydantic model.
+
+    The CLI is a PEP 723 single-file script with no Pydantic dep (would bloat
+    the install gesture). All six fields are ``str`` per the wire contract
+    (see ``src/ad_ingest/cli_version.py:CliVersionManifest`` and core-deploy
+    design §2 Analysis #1). ``parse`` validates the field set at runtime — a
+    missing or unexpected field surfaces as a :class:`click.ClickException`
+    so the operator sees a one-line classified failure, not a Python
+    ``KeyError`` traceback.
+    """
+
+    product: str
+    server_version: str
+    cli_recommended: str
+    cli_min_compatible: str
+    download_url: str
+    cli_sha256: str
+
+    @classmethod
+    def parse(cls, body: dict[str, Any]) -> CliVersionManifest:
+        """Validate ``body`` carries exactly the six declared ``str`` fields.
+
+        Raises :class:`click.ClickException` on missing or non-string fields
+        — operators see a classified failure rather than a Python ``KeyError``
+        or ``TypeError`` traceback.
+        """
+        required = ("product", "server_version", "cli_recommended",
+                    "cli_min_compatible", "download_url", "cli_sha256")
+        missing = [k for k in required if k not in body]
+        if missing:
+            raise click.ClickException(
+                f"manifest missing required field(s): {', '.join(missing)}"
+            )
+        for k in required:
+            if not isinstance(body[k], str):
+                raise click.ClickException(
+                    f"manifest field {k!r} expected str, got {type(body[k]).__name__}"
+                )
+        return cls(
+            product=body["product"],
+            server_version=body["server_version"],
+            cli_recommended=body["cli_recommended"],
+            cli_min_compatible=body["cli_min_compatible"],
+            download_url=body["download_url"],
+            cli_sha256=body["cli_sha256"],
+        )
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse a dotted X.Y.Z version into a comparable int-tuple.
+
+    ``"0.0.0-dev"`` strips the ``-dev`` suffix → ``(0, 0, 0)``. The placeholder
+    must always compare ``older-required`` against any real release because
+    ``-dev`` is the dev-tree seed Phase 1a bakes into the installed copy. Any
+    non-numeric component after stripping ``-dev`` raises
+    :class:`click.ClickException` so a malformed manifest never silently
+    compares as "equal" against an unexpected string.
+    """
+    bare = v.split("-", 1)[0]  # strip "-dev" / "-rc1" / etc.
+    parts = bare.split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError as e:
+        raise click.ClickException(
+            f"unparseable version {v!r}: expected dotted integers (X.Y.Z), got {e}"
+        ) from None
+
+
+class UpgradeFlow:
+    """Encapsulates the 9-step universal upgrade flow (core-deploy design §2).
+
+    Driven by :func:`upgrade` (Click subcommand). Steps:
+
+    1. Resolve target server (URL from config — env or ``--url`` override)
+    2. ``GET /v1/cli/version`` with Bearer → parse into
+       :class:`CliVersionManifest`
+    3. Verify ``manifest.product`` matches the bundled :data:`PRODUCT` literal;
+       mismatch → ABORT (operator pointed at the wrong product's server)
+    4. Compute verdict by comparing local :data:`__version__` to
+       ``manifest.cli_recommended`` (four branches; see :class:`UpgradeVerdict`)
+    5. (older-required only) ``GET manifest.download_url`` over HTTPS
+       (commit-SHA-pinned; no Bearer — GitHub raw is public)
+    6. (older-required only) Compute sha256 of fetched body; compare to
+       ``manifest.cli_sha256``; mismatch → ABORT
+    7. (older-required only) Write to ``<install_dir>/adingest.tmp``;
+       ``chmod +x``
+    8. (older-required only) Atomic :func:`os.replace` to target;
+       update ``<install_dir>/VERSION``
+    9. (older-required only) Print success; exit 0
+
+    The class is dependency-injectable for tests: ``install_dir`` parameterizes
+    the filesystem operations (use ``tmp_path`` in tests); the manifest fetch
+    and bytes fetch each use a dedicated :class:`httpx.Client` so tests can
+    inject :class:`httpx.MockTransport` via the ``manifest_transport`` and
+    ``bytes_transport`` parameters.
+    """
+
+    def __init__(
+        self,
+        config: AdingestConfig,
+        install_dir: Path | None = None,
+        manifest_transport: httpx.BaseTransport | None = None,
+        bytes_transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        # Path.home() / ".local" / "share" / "adingest" is functionally
+        # identical to Path("~/.local/share/adingest").expanduser() but
+        # doesn't depend on the ~ shell-style expansion mid-program.
+        self.config = config
+        self.install_dir: Path = (
+            install_dir if install_dir is not None
+            else Path.home() / ".local" / "share" / "adingest"
+        )
+        self._manifest_transport = manifest_transport
+        self._bytes_transport = bytes_transport
+
+    # --- Step 2: fetch manifest --------------------------------------------
+
+    def fetch_manifest(self) -> CliVersionManifest:
+        """``GET /v1/cli/version`` with Bearer; parse into the dataclass."""
+        client = httpx.Client(
+            base_url=self.config.url,
+            headers={"Authorization": f"Bearer {self.config.token}"},
+            timeout=30.0,
+            transport=self._manifest_transport,
+        )
+        try:
+            try:
+                resp = client.get("/v1/cli/version")
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise click.ClickException(
+                    f"HTTP {e.response.status_code} GET /v1/cli/version "
+                    f"(is the service running at {self.config.url}?)"
+                ) from None
+            except httpx.RequestError as e:
+                raise click.ClickException(
+                    f"network error {type(e).__name__}: {e} "
+                    f"(is the service running at {self.config.url}?)"
+                ) from None
+            try:
+                body = resp.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                raise click.ClickException(
+                    f"manifest response was not valid JSON: {e}"
+                ) from None
+            return CliVersionManifest.parse(body)
+        finally:
+            client.close()
+
+    # --- Step 3: product check ---------------------------------------------
+
+    def check_product(self, manifest: CliVersionManifest) -> None:
+        """Refuse upgrade when ``manifest.product != PRODUCT`` (bundled literal)."""
+        if manifest.product != PRODUCT:
+            raise click.ClickException(
+                f"manifest.product={manifest.product!r} != bundled "
+                f"PRODUCT={PRODUCT!r}; refusing to upgrade "
+                f"(operator pointed CLI at the wrong product's server)"
+            )
+
+    # --- Step 4: verdict ---------------------------------------------------
+
+    def compute_verdict(self, manifest: CliVersionManifest) -> UpgradeVerdict:
+        """Compare local ``__version__`` to ``manifest.cli_recommended``.
+
+        Four branches:
+
+        - **equal**: local == recommended → "Already at X.Y.Z"
+        - **local-newer**: local > recommended → "Server expects X.Y.Z"
+        - **older-compatible**: local < recommended AND local >= min_compatible →
+          informational nag; current still works
+        - **older-required**: local < min_compatible → proceeds to steps 5-9
+        """
+        local = _version_tuple(__version__)
+        recommended = _version_tuple(manifest.cli_recommended)
+        floor = _version_tuple(manifest.cli_min_compatible)
+        if local == recommended:
+            return "equal"
+        if local > recommended:
+            return "local-newer"
+        # local < recommended below.
+        if local >= floor:
+            return "older-compatible"
+        return "older-required"
+
+    # --- Step 5: fetch bytes -----------------------------------------------
+
+    def fetch_bytes(self, download_url: str) -> bytes:
+        """``GET`` the stamped CLI bytes from GitHub raw (no Bearer; public)."""
+        client = httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,
+            transport=self._bytes_transport,
+        )
+        try:
+            try:
+                resp = client.get(download_url)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise click.ClickException(
+                    f"HTTP {e.response.status_code} GET {download_url} "
+                    f"(commit-SHA-pinned URL — pre-bootstrap or mirror tag missing?)"
+                ) from None
+            except httpx.RequestError as e:
+                raise click.ClickException(
+                    f"network error {type(e).__name__}: {e} "
+                    f"(fetching CLI bytes from {download_url})"
+                ) from None
+            return resp.content
+        finally:
+            client.close()
+
+    # --- Step 6: sha256 verify ---------------------------------------------
+
+    def verify_sha256(self, body: bytes, expected_hex: str) -> None:
+        """Refuse to install bytes that don't match the manifest's sha256."""
+        actual = hashlib.sha256(body).hexdigest()
+        if actual != expected_hex:
+            raise click.ClickException(
+                f"sha256 mismatch: expected {expected_hex!r}, got {actual!r} "
+                f"(transport corruption OR mirror tampering — refusing to install)"
+            )
+
+    # --- Steps 7-8: atomic replace + VERSION update ------------------------
+
+    def atomic_replace(self, body: bytes, target_version: str) -> None:
+        """Write to ``adingest.tmp``, ``chmod +x``, then atomic rename.
+
+        Also updates ``<install_dir>/VERSION`` to ``target_version``. Both
+        files live in ``install_dir`` (same filesystem) so :func:`os.replace`
+        is POSIX-atomic.
+        """
+        self.install_dir.mkdir(parents=True, exist_ok=True)
+        target = self.install_dir / "adingest"
+        tmp = self.install_dir / "adingest.tmp"
+        tmp.write_bytes(body)
+        # chmod +x (0o755 = rwxr-xr-x); use os.chmod for stable POSIX semantics.
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
+        (self.install_dir / "VERSION").write_text(target_version + "\n")
+
+    # --- Step 1 + 9: orchestrate end-to-end --------------------------------
+
+    def run(self) -> None:
+        """Drive the 9-step flow; emit human-readable status per step."""
+        # Step 1 is implicit — config.url comes from env or --url override
+        # via _build_config; resolving the server is just reading config.url.
+        click.echo(f"Resolving server at {self.config.url}...")
+        # Step 2: fetch manifest.
+        manifest = self.fetch_manifest()
+        # Step 3: product check.
+        self.check_product(manifest)
+        # Step 4: verdict.
+        verdict = self.compute_verdict(manifest)
+        if verdict == "equal":
+            click.echo(f"Already at {__version__}")
+            return
+        if verdict == "local-newer":
+            click.echo(
+                f"Server expects {manifest.cli_recommended} (local {__version__})"
+            )
+            return
+        if verdict == "older-compatible":
+            click.echo(
+                f"Upgrade available: {__version__} -> {manifest.cli_recommended}; "
+                f"current works (floor={manifest.cli_min_compatible})"
+            )
+            return
+        # older-required → proceed to steps 5-9.
+        click.echo(
+            f"Required upgrade: {__version__} -> {manifest.cli_recommended} "
+            f"(below floor {manifest.cli_min_compatible})"
+        )
+        # Step 5: fetch bytes.
+        click.echo(f"Fetching {manifest.download_url}...")
+        body = self.fetch_bytes(manifest.download_url)
+        # Step 6: sha256 verify.
+        self.verify_sha256(body, manifest.cli_sha256)
+        click.echo(f"sha256 verified ({manifest.cli_sha256[:12]}...)")
+        # Steps 7-8: atomic replace + VERSION.
+        self.atomic_replace(body, manifest.cli_recommended)
+        # Step 9: success.
+        click.echo(
+            f"Upgraded {__version__} -> {manifest.cli_recommended} "
+            f"(installed at {self.install_dir / 'adingest'})"
+        )
+
+
+# --- Click CLI entry point --------------------------------------------------
+
+
+def _build_config(url: str | None, token: str | None, apps_file: str | None) -> AdingestConfig:
+    _load_env_client()
+    cfg = AdingestConfig.from_env()
+    overrides: dict[str, Any] = {}
+    if url:
+        overrides["url"] = url
+    if token:
+        overrides["token"] = token
+    if apps_file:
+        overrides["apps"] = json.loads(Path(apps_file).read_text())
+    return replace(cfg, **overrides) if overrides else cfg
+
+
+def _resolve_source(source: str | None, stub: bool) -> str:
+    if stub and source and source != "stub":
+        raise click.UsageError("--stub and --source are mutually exclusive")
+    return "stub" if stub else (source or "levelplay")
+
+
+def _iter_dates(start: date, end: date) -> Iterator[date]:
+    cur = start
+    while cur <= end:
+        yield cur
+        cur = cur + timedelta(days=1)
+
+
+def _emit(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
+    if as_json:
+        click.echo(json.dumps(_merge_verdicts_into_response(response)))
+        return
+    if not quiet:
+        # Force a wide console: rich's default 80-col falls back when stdout is
+        # not a TTY, which truncates the verdict column under CliRunner / pipes.
+        TableRenderer(Console(width=160)).render(response)
+
+
+def _common(f: Any) -> Any:
+    for opt in reversed((
+        click.option("--url", default=None, help="Override INGEST_API_URL"),
+        click.option("--token", default=None, help="Override INGEST_API_TOKEN"),
+        click.option("--json", "as_json", is_flag=True, help="Emit raw JSON (with verdicts)"),
+        click.option("--quiet", is_flag=True, help="Suppress non-verdict output"),
+    )):
+        f = opt(f)
+    return f
+
+
+@click.group(name="adingest")
+@click.version_option(__version__, "--version")
+def cli() -> None:
+    """adingest — project-agnostic CLI for the ad-ingest service."""
+
+
+@cli.command()
+@click.argument("event_date")
+@click.option("--poll", is_flag=True, help="Poll until job is terminal")
+@click.option("--source", default=None, help="Source name (default: levelplay)")
+@click.option("--stub", is_flag=True, help="Alias for --source stub")
+@click.option("--apps", "apps_file", default=None, type=click.Path(exists=True),
+              help="JSON file with apps[]")
+@_common
+def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_file: str | None,
+           url: str | None, token: str | None, as_json: bool, quiet: bool) -> None:
+    """POST one ingest for EVENT_DATE (YYYY-MM-DD)."""
+    cfg = _build_config(url, token, apps_file)
+    client = AdingestClient(cfg)
+    resp = client.post_ingest(event_date, _resolve_source(source, stub), cfg.apps)
+    if poll and resp.get("job_id"):
+        resp = client.poll_until_terminal(resp["job_id"])
+    _emit(resp, as_json, quiet)
+
+
+@cli.command(name="range")
+@click.argument("date_range")
+@click.option("--poll", is_flag=True, help="Poll each job until terminal")
+@click.option("--source", default=None, help="Source name (default: levelplay)")
+@click.option("--stub", is_flag=True, help="Alias for --source stub")
+@click.option("--apps", "apps_file", default=None, type=click.Path(exists=True),
+              help="JSON file with apps[]")
+@click.option("--continue-on-failure", is_flag=True, help="Do not abort on first failure")
+@_common
+def range_cmd(
+    date_range: str, poll: bool, source: str | None, stub: bool, apps_file: str | None,
+    continue_on_failure: bool, url: str | None, token: str | None,
+    as_json: bool, quiet: bool,
+) -> None:
+    """Fire one ingest per day in START..END (inclusive)."""
+    if ".." not in date_range:
+        raise click.UsageError("date range must be in form START..END")
+    start_s, _, end_s = date_range.partition("..")
+    start, end = date.fromisoformat(start_s), date.fromisoformat(end_s)
+    if end < start:
+        raise click.UsageError("END date must be >= START date")
+    cfg = _build_config(url, token, apps_file)
+    src = _resolve_source(source, stub)
+    client = AdingestClient(cfg)
+    for day in _iter_dates(start, end):
+        resp = client.post_ingest(day.isoformat(), src, cfg.apps)
+        if poll and resp.get("job_id"):
+            resp = client.poll_until_terminal(resp["job_id"])
+        _emit(resp, as_json, quiet)
+        if resp.get("status") == "failed" and not continue_on_failure:
+            sys.exit(1)
+
+
+@cli.command()
+@click.argument("job_id")
+@_common
+def status(job_id: str, url: str | None, token: str | None, as_json: bool, quiet: bool) -> None:
+    """GET status for JOB_ID."""
+    cfg = _build_config(url, token, None)
+    resp = AdingestClient(cfg).get_job(job_id)
+    _emit(resp, as_json, quiet)
+
+
+@cli.command()
+@click.option("--url", default=None, help="Override INGEST_API_URL")
+@click.option("--token", default=None, help="Override INGEST_API_TOKEN")
+def upgrade(url: str | None, token: str | None) -> None:
+    """Upgrade the installed CLI via the service manifest + GitHub mirror.
+
+    Drives the 9-step universal upgrade flow (see :class:`UpgradeFlow`):
+    fetches ``/v1/cli/version`` manifest, verifies product identity, computes
+    a verdict, and (for older-required) fetches commit-SHA-pinned bytes from
+    the public mirror, sha256-verifies, and atomically replaces the installed
+    copy.
+
+    Same code path works against any substrate (localhost uvicorn today,
+    AWS App Runner tomorrow) because the manifest contract is wire-stable.
+    """
+    cfg = _build_config(url, token, None)
+    flow = UpgradeFlow(cfg)
+    flow.run()
+
+
+if __name__ == "__main__":
+    cli()
