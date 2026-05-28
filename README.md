@@ -40,12 +40,14 @@ adingest --version
 adingest, version 0.1.0
 ```
 
-Point it at a service:
+Point it at a service — `adingest init <slug>` bootstraps `~/.adingest/<slug>/config.toml` + `.env` with template placeholders; edit those two files (see [Configuration](#configuration) below for the layout):
 
 ```bash
-export INGEST_API_URL=https://api.creational.ai
-export INGEST_API_TOKEN=<bearer token from the service operator>
-export APPS_JSON='[{"app_id":"com.acme.app","platform":"ios"}]'
+$ adingest init dev
+Active project: dev
+
+$ ${EDITOR:-vi} ~/.adingest/dev/config.toml    # set [ingest_api].url + [[apps]]
+$ ${EDITOR:-vi} ~/.adingest/dev/.env           # set INGEST_API_TOKEN=<bearer>
 ```
 
 First use — stub mode exercises the full wire path without upstream credentials:
@@ -64,23 +66,65 @@ GA4: attempted=3  sent=3  skipped_orphan=0  failed=0
 
 ## Configuration
 
-Three environment variables (or per-invocation flags). The CLI also reads `.env.client` in the current working directory if present.
+The CLI reads config from `~/.adingest/` — outside any project repo. Bootstrap a new project with `adingest init <slug>`; switch the active one with `adingest use <slug>`; inspect with `adingest projects` / `current` / `config show`.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `INGEST_API_URL` | yes | Service base URL (e.g. `https://api.creational.ai` or `http://localhost:8000`) |
-| `INGEST_API_TOKEN` | yes | Bearer token issued by the service operator |
-| `APPS_JSON` | yes for `ingest` / `range` | JSON array of `{app_id, platform}` objects — the apps to ingest for |
-
-`.env.client` example:
-
-```bash
-INGEST_API_URL=https://api.creational.ai
-INGEST_API_TOKEN=<bearer>
-APPS_JSON='[{"app_id":"com.acme.app","platform":"ios"},{"app_id":"com.acme.app","platform":"android"}]'
+```
+~/.adingest/
+├── config.toml                # global defaults (service URL + bearer token)
+├── state.toml                 # active-project pointer (mutated by `adingest use`)
+└── <slug>/
+    ├── config.toml            # per-project structural config (BQ, LP, apps[])
+    └── .env                   # per-project secrets (mode 0600; CLI auto-sources)
 ```
 
-Every subcommand accepts `--url`, `--token`, and `--apps FILE` (a JSON file path that overrides `APPS_JSON`).
+Walkup commands (the `ls` / `cd` / `pwd` / `mkdir` for projects):
+
+```bash
+$ adingest projects             # list configured projects (* marks active)
+* hexario
+  staging
+
+$ adingest use staging          # switch active project (persists across shells)
+Active project: staging  (was: hexario)
+
+$ adingest current              # what's active right now
+staging
+
+$ adingest init <slug>          # bootstrap a new project; sets active if no current active
+
+$ adingest config show          # render the resolved config for the active project
+```
+
+A minimal per-project `config.toml`:
+
+```toml
+[ingest_api]
+url   = "https://api.creational.ai"     # also settable globally in ~/.adingest/config.toml
+token = "${INGEST_API_TOKEN}"           # env-interpolated from ~/.adingest/<slug>/.env
+
+[[apps]]
+app_id   = "com.acme.app"
+platform = "ios"
+```
+
+And the matching `~/.adingest/<slug>/.env` (mode 0600 — CLI warns on looser perms):
+
+```bash
+INGEST_API_TOKEN=<bearer token from the service operator>
+```
+
+**Selection precedence** (highest wins): `--project <slug>` flag → `ADINGEST_PROJECT` env var → `~/.adingest/state.toml` active → error with a remediation hint. `state.toml` is read once at process startup and cached for that process's lifetime — a concurrent `adingest use <other>` in another shell can't redirect an in-flight ingest. State writes are atomic (`fsync` + `os.replace`); a crash mid-`use` never leaves the file half-written.
+
+**Parallel runs**: two `adingest` instances can run in parallel from any cwd:
+
+```bash
+$ adingest --project hexario ingest 2026-05-27 & \
+  adingest --project staging ingest 2026-05-27 &
+```
+
+Use the always-explicit `--project <slug>` form for cron / scripted invocations so interactive `use` of another slug never redirects them.
+
+Every subcommand accepts `--url`, `--token`, and `--project <slug>` (overrides cascade). `ingest` / `range` additionally accept `--apps FILE` (a JSON file path that overrides the per-project TOML `[[apps]]` list).
 
 > Credentials live in the service's request body for one call and are dropped after the response. The service is stateless — nothing about your account is persisted on it.
 

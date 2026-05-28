@@ -5,6 +5,7 @@
 #   "httpx>=0.27",
 #   "rich>=13.0",
 #   "click>=8.1",
+#   "tomli-w>=1.0",
 # ]
 # ///
 """adingest — project-agnostic CLI for the ad-ingest service.
@@ -18,8 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -28,6 +31,7 @@ from typing import Any, ClassVar, Literal
 
 import click
 import httpx
+import tomli_w
 from rich.console import Console
 from rich.table import Table
 
@@ -37,7 +41,7 @@ from rich.table import Table
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -50,7 +54,14 @@ PRODUCT = "adingest"
 
 @dataclass(frozen=True)
 class AdingestConfig:
-    """Caller-side configuration; frozen so flag overrides go through ``replace``."""
+    """Caller-side configuration; frozen so flag overrides go through ``replace``.
+
+    Step 9 of core-cli-config-refactor: the legacy ``from_env`` classmethod and
+    the cwd-coupled ``_load_env_client`` loader were removed in favor of the
+    TOML-backed ``load_config(slug)`` pipeline (Step 3). The dataclass shape is
+    unchanged — same eight fields, same defaults, still frozen — but the
+    construction surface is now the loader, not env-var scraping.
+    """
     url: str = "http://localhost:8000"
     token: str = ""
     apps: list[dict[str, Any]] = field(default_factory=list)
@@ -60,35 +71,681 @@ class AdingestConfig:
     bq_dataset: str = ""
     bq_sa_key_path: str = ""
 
-    @classmethod
-    def from_env(cls) -> AdingestConfig:
-        apps_raw = os.environ.get("APPS_JSON", "[]")
-        try:
-            apps = json.loads(apps_raw) if apps_raw else []
-        except json.JSONDecodeError:
-            apps = []
-        return cls(
-            url=os.environ.get("INGEST_API_URL", "http://localhost:8000"),
-            token=os.environ.get("INGEST_API_TOKEN", ""),
-            apps=apps,
-            lp_secret_key=os.environ.get("LP_SECRET_KEY", ""),
-            lp_refresh_token=os.environ.get("LP_REFRESH_TOKEN", ""),
-            bq_project_id=os.environ.get("BQ_TEST_PROJECT_ID", ""),
-            bq_dataset=os.environ.get("BQ_TEST_DATASET", ""),
-            bq_sa_key_path=os.environ.get("BQ_TEST_SA_KEY_PATH", ""),
+
+# --- TOML config loader (~/.adingest/<slug>/) ------------------------------
+#
+# These helpers compose into ``load_config(slug)`` (landed in a later step).
+# Here we land only the lowest-level primitives — no CLI surface change yet.
+#
+# Pipeline order downstream callers will follow:
+#   1. ``_read_toml_if_exists(home/'config.toml')`` — optional global defaults
+#   2. ``_read_toml(home/<slug>/'config.toml')``    — required per-caller
+#   3. ``_deep_merge(global, per_caller)``          — overlay per-caller on global
+#   4. ``_interpolate_env_recursive(merged)``       — substitute ``${VAR}``
+#   5. ``_to_adingest_config(interpolated)``        — translate to dataclass
+#
+# Step 1 lands steps 1, 3, and 4 (plus the no-op ``_read_toml_if_exists``);
+# Steps 2-3 land the rest.
+
+#: Operator-owned config home. Override with ``ADINGEST_HOME`` for tests / sandbox runs.
+ADINGEST_HOME: Path = Path(os.environ.get("ADINGEST_HOME") or (Path.home() / ".adingest"))
+
+#: ``${VAR}`` reference pattern. Matches POSIX-style uppercase env var names
+#: (``A-Z``, digits, underscore; must start with letter or underscore). Only
+#: scalar string values are scanned for substitutions; ints/bools/floats pass
+#: through ``_interpolate_env_recursive`` untouched.
+_ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    """Parse a required TOML file via stdlib ``tomllib`` (binary mode).
+
+    Caller is responsible for the missing-file case; this helper raises
+    whatever ``open()`` raises if the file is absent (typically
+    ``FileNotFoundError``). Use ``_read_toml_if_exists`` when the file is
+    optional.
+
+    Malformed TOML → ``click.ClickException`` naming the path + the
+    underlying parser message, so operators see a one-line classified
+    failure (e.g., ``Error: TOML parse error in ~/.adingest/hexario/config.toml:
+    Expected '=' after a key in a key/value pair``) instead of a raw traceback.
+
+    Binary mode (``'rb'``) is REQUIRED by ``tomllib.load`` — text mode raises
+    ``TypeError`` per the stdlib contract.
+    """
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise click.ClickException(f"TOML parse error in {path}: {e}") from None
+
+
+def _read_toml_if_exists(path: Path) -> dict[str, Any]:
+    """Parse a TOML file if it exists; return ``{}`` if absent.
+
+    Used for optional global config (``~/.adingest/config.toml``) where
+    the file's absence is a legitimate state (no global defaults set).
+    A malformed file still raises (via ``_read_toml``) — missing != broken.
+    """
+    if not path.exists():
+        return {}
+    return _read_toml(path)
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursive dict overlay; leaf-level merge, arrays REPLACE wholesale.
+
+    Per design decision D14: when ``overlay`` carries a value for a key
+    that ``base`` also has, the overlay wins at the leaf. For nested
+    dicts, recursion continues; for any non-dict leaf (including
+    ``list``), the overlay value replaces the base value entirely. Arrays
+    are NEVER concatenated — a per-caller ``[[apps]]`` block replaces the
+    global one wholesale, not appended to it.
+
+    The returned dict is a new top-level dict; nested dicts that come
+    from ``base`` only (no overlay collision) are reused by reference,
+    not deep-copied. Callers must not mutate the result if they intend to
+    preserve the inputs.
+
+    Examples::
+
+        _deep_merge({"a": {"x": 1, "y": 2}}, {"a": {"x": 99}})
+        # → {"a": {"x": 99, "y": 2}}
+
+        _deep_merge({"apps": [{"id": "a"}]}, {"apps": [{"id": "b"}]})
+        # → {"apps": [{"id": "b"}]}      # arrays REPLACE, not concatenate
+    """
+    merged: dict[str, Any] = dict(base)
+    for key, overlay_value in overlay.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(overlay_value, dict):
+            merged[key] = _deep_merge(base_value, overlay_value)
+        else:
+            merged[key] = overlay_value
+    return merged
+
+
+def _interpolate_env_recursive(value: Any) -> Any:
+    """Substitute ``${VAR}`` references in string values from ``os.environ``.
+
+    Walks dicts and lists recursively; only ``str`` leaves are scanned.
+    Non-string leaves (``int``, ``bool``, ``float``, ``None``) pass
+    through untouched — TOML integers and booleans are NOT coerced
+    through string interpolation.
+
+    Missing env var → ``click.ClickException`` naming the variable and
+    pointing the operator at the two candidate sources (``.env`` file or
+    shell environment). NEVER silent empty-string substitution: a typo'd
+    ``${INGEST_API_TKOEN}`` must fail loudly at config-load time, not
+    silently produce an empty Bearer token that the server rejects with
+    an opaque 401.
+
+    Multiple references in a single string are all substituted in one
+    pass; partial substitution is not exposed — either every ``${VAR}``
+    resolves or the whole string raises.
+    """
+    if isinstance(value, dict):
+        return {k: _interpolate_env_recursive(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_env_recursive(item) for item in value]
+    if isinstance(value, str):
+        def _replace(match: re.Match[str]) -> str:
+            var_name = match.group(1)
+            env_value = os.environ.get(var_name)
+            if env_value is None:
+                raise click.ClickException(
+                    f"missing env var ${{{var_name}}} referenced in TOML config "
+                    f"(check ~/.adingest/<slug>/.env or your shell environment)"
+                )
+            return env_value
+        return _ENV_PATTERN.sub(_replace, value)
+    return value
+
+
+def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
+    """Translate a merged-and-interpolated TOML dict to a frozen ``AdingestConfig``.
+
+    Pipeline position: runs AFTER ``_deep_merge`` (global + per-caller overlay)
+    and AFTER ``_interpolate_env_recursive`` (``${VAR}`` substitution). This
+    step is purely structural — TOML sections to dataclass fields — with one
+    side-effect-free transform: ``~``-expansion on path-typed fields.
+
+    Section-to-field map (per D14, the TOML schema mirrors wire-contract
+    field names; no flat-to-nested translation)::
+
+        TOML key                          AdingestConfig field
+        ────────────────────────────────  ─────────────────────────
+        [ingest_api].url                  url
+        [ingest_api].token                token
+        [levelplay].secret_key            lp_secret_key
+        [levelplay].refresh_token         lp_refresh_token
+        [bq].project_id                   bq_project_id
+        [bq].dataset                      bq_dataset
+        [bq].sa_key_path                  bq_sa_key_path  (expanduser applied)
+        [[apps]]                          apps            (list pass-through)
+
+    Path-typed fields: only ``bq_sa_key_path`` today. ``${VAR}`` interpolation
+    happens BEFORE this step; ``~``-expansion happens AFTER, so a
+    ``${HOME}``-interpolated path that still carries a literal ``~`` (e.g.,
+    if an operator wrote ``"~${REGION_SLUG}/key.json"``) gets its leading
+    ``~`` expanded too. The result is cast back to ``str`` to match the
+    dataclass field type — no ``pathlib.Path`` leaks into the validated
+    boundary, and no filesystem check (``.exists()``/``.resolve()``) is
+    performed; existence enforcement is the responsibility of whichever
+    consumer actually opens the file.
+
+    Unknown TOML keys (top-level sections OR nested keys inside known
+    sections) are SILENTLY IGNORED for forward-compatibility: an older CLI
+    consuming a newer config.toml that declares a future ``[gateway]`` block
+    must not crash. Missing fields are NOT enforced here either — the
+    ``AdingestConfig`` dataclass carries safe defaults (empty strings, empty
+    list), and wire-contract validation happens server-side per CLAUDE.md
+    durable invariant #2 (stateless service; consumer owns config).
+
+    ``[[apps]]`` is passed through verbatim — each app dict retains its
+    nested ``ga4`` sub-dict (``app["ga4"] = {"measurement_id": ..., "api_secret": ...}``)
+    as produced by ``tomllib``. The dataclass field type is
+    ``list[dict[str, Any]]``; downstream consumers (``AdingestClient._build_body``)
+    treat each app as an opaque dict per the wire contract.
+
+    Examples::
+
+        >>> _to_adingest_config({
+        ...     "ingest_api": {"url": "https://api.creational.ai", "token": "t"},
+        ...     "bq": {"sa_key_path": "~/.adingest/hexario/bq.json"},
+        ... })  # doctest: +SKIP
+        AdingestConfig(url='https://api.creational.ai', token='t',
+                       bq_sa_key_path='/Users/<user>/.adingest/hexario/bq.json',
+                       ...)
+    """
+    ingest_api = merged.get("ingest_api") or {}
+    levelplay = merged.get("levelplay") or {}
+    bq = merged.get("bq") or {}
+    apps = merged.get("apps") or []
+
+    bq_sa_key_path_raw = bq.get("sa_key_path", "")
+    bq_sa_key_path = (
+        str(Path(bq_sa_key_path_raw).expanduser()) if bq_sa_key_path_raw else ""
+    )
+
+    return AdingestConfig(
+        url=ingest_api.get("url", "http://localhost:8000"),
+        token=ingest_api.get("token", ""),
+        apps=list(apps),
+        lp_secret_key=levelplay.get("secret_key", ""),
+        lp_refresh_token=levelplay.get("refresh_token", ""),
+        bq_project_id=bq.get("project_id", ""),
+        bq_dataset=bq.get("dataset", ""),
+        bq_sa_key_path=bq_sa_key_path,
+    )
+
+
+def load_config(slug: str, home: Path = ADINGEST_HOME) -> AdingestConfig:
+    """Load and compose the caller-scoped ``AdingestConfig`` for ``slug``.
+
+    Top-level orchestrator that wires Steps 1-2's primitives into the
+    single entry point the rest of the CLI consumes. The pipeline is
+    fully deterministic: no env-var reads occur outside ``${VAR}``
+    interpolation, no filesystem walks beyond the two well-known TOML
+    paths, no caching (callers cache at higher layers if needed).
+
+    Pipeline (in order)::
+
+        1. _read_toml_if_exists(home / "config.toml")       # global defaults (optional)
+        2. _read_toml(home / slug / "config.toml")          # per-caller (REQUIRED)
+        3. _deep_merge(global, per_caller)                  # per-caller wins at leaves
+        4. _interpolate_env_recursive(merged)               # substitute ${VAR} from os.environ
+        5. _to_adingest_config(interpolated)                # translate to frozen dataclass
+
+    Ordering invariants (each test-pinned)::
+
+        * Interpolation runs AFTER deep-merge: a per-caller override of a
+          global ``${VAR}`` reference avoids the missing-var error if the
+          per-caller value is a literal (no ``${...}``). This means an
+          operator can shadow a globally-referenced secret without setting
+          the env var the global value points at.
+        * Path expansion runs AFTER interpolation: a global
+          ``sa_key_path = "${HOME}/.adingest/<slug>/key.json"`` survives
+          ``${HOME}`` substitution first, then any residual ``~`` would
+          expand. (In practice ``${HOME}`` interpolation produces an
+          absolute path so the expanduser pass is a no-op, but the order
+          is what matters for the contract.)
+
+    Missing per-caller ``config.toml`` is a HARD ERROR — the loader has
+    no idea what caller the operator meant if the directory doesn't
+    exist. The raised ``ClickException`` carries the exact bootstrap
+    command so a copy-paste-from-error-message recovery works.
+
+    Malformed TOML in either file is a HARD ERROR — propagated through
+    ``_read_toml`` with the file path in the message.
+
+    The optional ``home`` parameter exists for test injection (fixtures
+    point at a tmp directory). Production callers omit it and the
+    module-level ``ADINGEST_HOME`` is used.
+
+    Args:
+        slug: The caller's slug (e.g., ``"hexario"``); used to locate
+            ``<home>/<slug>/config.toml``. NOT validated here — callers
+            that take user input should call ``_validate_slug`` first
+            (Step 4 lands the validator).
+        home: Root of the caller config tree. Defaults to
+            ``ADINGEST_HOME`` (``$ADINGEST_HOME`` env override or
+            ``~/.adingest``).
+
+    Returns:
+        Frozen ``AdingestConfig`` with all fields populated from the
+        merged-then-interpolated TOML. Unknown keys silently ignored;
+        missing fields fall back to dataclass defaults.
+
+    Raises:
+        click.ClickException: per-caller ``config.toml`` absent (with
+            bootstrap-command hint), or either file is malformed TOML,
+            or a ``${VAR}`` reference has no matching env var.
+
+    Examples::
+
+        >>> load_config("hexario")  # doctest: +SKIP
+        AdingestConfig(url='https://api.creational.ai', token='...', ...)
+    """
+    per_caller_path = home / slug / "config.toml"
+    if not per_caller_path.exists():
+        raise click.ClickException(
+            f"project {slug} not initialized — no {per_caller_path}; "
+            f"run `adingest init {slug}` first"
+        )
+
+    global_dict = _read_toml_if_exists(home / "config.toml")
+    per_caller_dict = _read_toml(per_caller_path)
+    merged = _deep_merge(global_dict, per_caller_dict)
+    interpolated = _interpolate_env_recursive(merged)
+    return _to_adingest_config(interpolated)
+
+
+# --- Project selection: state.toml + atomic write + slug validation ---------
+#
+# Step 4 of core-cli-config-refactor. Adds three primitives layered on top of
+# the Step 1-3 loader:
+#
+# * ``_atomic_write_text`` — POSIX-atomic file write via tmp + fsync +
+#   ``os.replace`` + parent-dir fsync. Single source of truth for atomic
+#   writes; reused by ``state.toml`` writes here and by the migration-side
+#   ``_merge_global_config`` (Step 11).
+# * ``_read_state_active`` / ``write_state_active`` — read/write the
+#   ``~/.adingest/state.toml`` active-project pointer. Loud-failure on
+#   malformed TOML; silent on absent file (cascade fallthrough — Step 5
+#   composes this with ``$ADINGEST_PROJECT`` + ``--project`` flag).
+# * ``_validate_slug`` — slug character/shape validation. Used by
+#   ``_read_state_active`` (defensive on path-traversal attempts in
+#   ``state.toml``'s ``active`` value), by ``adingest use <slug>``
+#   (Step 6 — pre-write validation), and by ``adingest init <slug>``
+#   (Step 7 — pre-bootstrap validation).
+#
+# Crash-durability contract: ``_atomic_write_text`` guarantees that a
+# crash mid-write leaves the prior target file content intact (the
+# rename via ``os.replace`` is POSIX-atomic). Parent-dir fsync is
+# best-effort: on non-POSIX filesystems where it raises ``OSError``,
+# durability degrades to file-content-only — file is still atomically
+# replaced, but the directory entry may not survive a power loss.
+
+# Slug shape: lowercase alphanumeric + interior hyphens. Must start AND
+# end with [a-z0-9]. Single-char allowed ("a"); pure hyphens rejected.
+# ``re.fullmatch`` (NOT ``re.match``) is required — without it,
+# ``foo/bar`` would silently match the ``foo`` prefix and bypass the
+# path-traversal defense.
+_SLUG_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+
+
+def _validate_slug(slug: str) -> None:
+    """Validate a project slug against the canonical shape contract.
+
+    Slugs must match ``[a-z0-9](?:[a-z0-9-]*[a-z0-9])?`` — lowercase
+    alphanumeric with interior hyphens; alphanumeric start AND end.
+    Single-char slugs are allowed (``"a"``). Pure-hyphens, leading/trailing
+    hyphens, uppercase letters, and path-separator characters are rejected.
+
+    The full-string contract is enforced via ``re.fullmatch`` (NOT
+    ``re.match``, which would silently match a ``foo/bar`` slug at the
+    ``foo`` prefix and bypass the path-traversal defense).
+
+    Raises:
+        click.UsageError: When the slug is empty, the wrong shape, or
+            contains characters outside the allowed set. The message
+            names the slug AND the allowed pattern so the operator can
+            self-correct.
+
+    Examples:
+        >>> _validate_slug("hexario")     # OK
+        >>> _validate_slug("a-b-c")       # OK
+        >>> _validate_slug("a")           # OK (single-char allowed)
+        >>> _validate_slug("-a")          # raises UsageError
+        >>> _validate_slug("a-")          # raises UsageError
+        >>> _validate_slug("Hex")         # raises UsageError (uppercase)
+        >>> _validate_slug("foo/bar")     # raises UsageError (path sep)
+    """
+    if not _SLUG_PATTERN.fullmatch(slug):
+        raise click.UsageError(
+            f"invalid slug {slug!r}; must match [a-z0-9-]+ "
+            f"(lowercase letters/digits/hyphen; alphanumeric start+end)"
         )
 
 
-def _load_env_client(cwd: Path | None = None) -> None:
-    """Source ``.env.client`` from CWD if present (``KEY=value`` lines, ``#`` comments)."""
-    path = (cwd or Path.cwd()) / ".env.client"
-    if not path.exists():
+def _atomic_write_text(target: Path, payload: str, home: Path) -> None:
+    """Atomically write ``payload`` to ``target`` via tmp + fsync + rename.
+
+    POSIX-atomic write sequence:
+
+    1. Write ``payload`` to ``<target>.tmp`` (binary mode to avoid encoding ambiguity)
+    2. ``os.fsync`` the tmp file's fd so the bytes hit disk
+    3. ``os.replace(tmp, target)`` — atomic rename (POSIX guarantee)
+    4. Open ``home`` directory with ``os.O_DIRECTORY``, ``os.fsync`` the
+       dir fd so the rename itself is durable
+
+    Crash mid-step 1 or 2: ``target`` retains its prior content; the
+    ``.tmp`` file may linger but is orphaned (next write replaces it).
+    Crash mid-step 3: rename is atomic — caller sees either the old or
+    the new content, never a half-written file. Crash mid-step 4: file
+    content is replaced but the directory entry may not survive a power
+    loss (best-effort durability).
+
+    Parent-dir fsync portability: on macOS/Linux, ``os.fsync`` on a
+    directory fd is supported. On Windows or some non-POSIX filesystems,
+    it raises ``OSError``; we swallow the error there — file content is
+    still atomic-replaced, just not durably committed against power loss.
+
+    Args:
+        target: Destination path. Parent directory must already exist
+            (caller's responsibility — usually via ``home.mkdir(parents=True,
+            exist_ok=True)`` on the slug-scoped dir).
+        payload: String content to write (UTF-8 encoded internally).
+        home: Directory whose fd to fsync after the rename. Usually the
+            parent of ``target`` (``target.parent``), but passed
+            explicitly so callers can fsync the canonical home root even
+            when writing nested files.
+    """
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    data = payload.encode("utf-8")
+
+    # Step 1+2: write payload to tmp, fsync the file fd.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    # Step 3: atomic rename. After this point ``target`` has the new content.
+    os.replace(tmp, target)
+
+    # Step 4: parent-dir fsync (best-effort on non-POSIX FS).
+    try:
+        dir_fd = os.open(home, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Non-POSIX filesystem (e.g., Windows). File content is atomic,
+        # but the directory entry may not survive a power loss. This is
+        # the documented degraded-durability path.
+        pass
+
+
+def _read_state_active(home: Path) -> str | None:
+    """Read ``home/state.toml`` and return the ``active`` slug (or None).
+
+    Cascade semantics: this is the third tier of the project-selection
+    cascade (after ``--project`` flag and ``$ADINGEST_PROJECT``). Returns
+    ``None`` when ``state.toml`` is absent (cascade fallthrough); raises
+    loudly on malformed TOML or invalid ``active`` value (R1 MED#1 fix —
+    silent fallthrough on a corrupt state file would hide the corruption
+    and let the cascade silently mis-route, which is worse than failing
+    fast).
+
+    Returns:
+        The validated ``active`` slug as a str, or ``None`` when
+        ``state.toml`` doesn't exist OR exists but lacks an ``active`` key.
+
+    Raises:
+        click.ClickException: When ``state.toml`` exists but is malformed
+            TOML, or when ``active`` is present but isn't a string
+            matching ``_validate_slug``. The message names the repair
+            command (``adingest use <slug>``) so the operator can recover
+            without manual file editing.
+    """
+    state_path = home / "state.toml"
+    if not state_path.exists():
+        return None
+
+    try:
+        with state_path.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise click.ClickException(
+            f"state.toml malformed at {state_path}: {e}; "
+            f"re-run `adingest use <slug>` to repair"
+        ) from e
+
+    active = data.get("active")
+    if active is None:
+        return None
+
+    if not isinstance(active, str):
+        raise click.ClickException(
+            f"state.toml has invalid `active` value {active!r} at {state_path}; "
+            f"expected a string slug; re-run `adingest use <slug>` to repair"
+        )
+
+    # Validate slug shape — defense against path-traversal injection via
+    # state.toml (e.g., ``active = "../etc"``).
+    try:
+        _validate_slug(active)
+    except click.UsageError as e:
+        raise click.ClickException(
+            f"state.toml has invalid slug {active!r} at {state_path}: {e.message}; "
+            f"re-run `adingest use <slug>` to repair"
+        ) from e
+
+    return active
+
+
+def write_state_active(slug: str, home: Path = ADINGEST_HOME) -> None:
+    """Atomically write the active-project pointer to ``home/state.toml``.
+
+    Creates ``home`` if it doesn't already exist (covers the bootstrap
+    path where ``adingest init <slug>`` materializes ``~/.adingest/`` for
+    the first time). Slug is NOT validated here — callers (``use`` /
+    ``init``) validate before calling so the operator-facing UsageError
+    fires earlier in the command body.
+
+    The TOML payload uses literal quoted-string syntax (``active = "..."``)
+    rather than ``tomli_w.dumps`` for the trivial single-key case —
+    keeps Step 4 dependency-free (``tomli_w`` is needed later in Step 11
+    for the migration-side global TOML writes).
+
+    Args:
+        slug: Validated project slug (alphanumeric + interior hyphens).
+        home: Project home dir. Defaults to ``ADINGEST_HOME`` module
+            constant; tests inject a ``tmp_path``.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(home / "state.toml", f'active = "{slug}"\n', home)
+
+
+# --- Selection cascade + cache + per-caller env sourcing --------------------
+#
+# Step 5 of core-cli-config-refactor. Layers the 4-tier project-selection
+# cascade on top of Step 4's ``_read_state_active``, with a read-once-at-startup
+# module-level cache so a long-running CLI invocation never re-resolves the
+# active project mid-flight (Goal 3 concurrency contract: an in-flight
+# ``ingest`` started against ``hexario`` stays on ``hexario`` even if a
+# concurrent shell runs ``adingest use staging``).
+#
+# Cascade order (highest precedence first):
+#   1. ``--project <slug>`` flag (``explicit`` argument)
+#   2. ``$ADINGEST_PROJECT`` env-var
+#   3. ``~/.adingest/state.toml`` → ``active``
+#   4. Loud failure (no fallback)
+#
+# Cache contract per R1 MED#2:
+#   * First call (with or without ``explicit``) populates the cache; subsequent
+#     calls return the cached slug REGARDLESS of ``explicit`` / env / state.toml
+#     mutations that happen later in the process lifetime.
+#   * Production CLI invocations are one-command-per-process so the cache is
+#     always cold when ``_build_config`` (Step 9) is first entered; the cache
+#     only matters when (a) the same process runs multiple commands (tests via
+#     ``CliRunner``) or (b) a long-running call re-resolves mid-flight.
+#   * ``_invalidate_cache_for_tests()`` is the test-only escape hatch; Step 14
+#     lands the autouse ``_reset_cli_cache`` fixture that calls it between tests.
+
+#: Module-level cache for the resolved active-project slug. ``None`` means
+#: "not yet resolved this process"; once set, ``resolve_active_project``
+#: returns the cached value without re-reading state.toml or env.
+_ACTIVE_PROJECT_CACHE: str | None = None
+
+
+def _invalidate_cache_for_tests() -> None:
+    """Reset ``_ACTIVE_PROJECT_CACHE`` to ``None``.
+
+    Test-only escape hatch per D12. Production code MUST NOT call this —
+    the cache contract is "resolve once, never re-resolve". Tests that
+    exercise the cascade in series against the same process need to
+    reset the cache between scenarios; Step 14 lands the autouse
+    ``_reset_cli_cache`` fixture that calls this helper between tests.
+    """
+    global _ACTIVE_PROJECT_CACHE
+    _ACTIVE_PROJECT_CACHE = None
+
+
+def resolve_active_project(
+    explicit: str | None = None, home: Path = ADINGEST_HOME
+) -> str:
+    """Resolve the active-project slug via the 4-tier cascade.
+
+    Cascade order (highest precedence first):
+
+    1. ``explicit`` — the ``--project <slug>`` flag value (typically passed
+       through from Click command bodies)
+    2. ``$ADINGEST_PROJECT`` — environment variable
+    3. ``~/.adingest/state.toml`` → ``active`` — operator-set persistent default
+    4. Loud failure — no fallback; the cascade is exhaustive
+
+    Cache contract per R1 MED#2:
+        * First call populates ``_ACTIVE_PROJECT_CACHE`` from whichever
+          tier wins; subsequent calls return the cached slug.
+        * ``explicit`` is checked FIRST (before cache short-circuit) so the
+          first call with a flag sets the cache to the flag value. BUT if
+          the cache is already set to something else, ``explicit`` is
+          IGNORED silently — production never re-resolves, and a second
+          flag-bearing call in the same process indicates either a test
+          (which should ``_invalidate_cache_for_tests`` first) or a bug.
+        * Env-var and state.toml reads also seed the cache on first call;
+          subsequent mutations to either source are invisible.
+
+    Args:
+        explicit: The ``--project`` flag value, or ``None`` when the flag
+            isn't supplied. Validated via ``_validate_slug`` if non-None.
+        home: Project home dir. Defaults to ``ADINGEST_HOME`` module
+            constant; tests inject a ``tmp_path``.
+
+    Returns:
+        The resolved (or cached) project slug.
+
+    Raises:
+        click.UsageError: When ``explicit`` or ``$ADINGEST_PROJECT`` fails
+            slug validation (defensive against operator typos).
+        click.ClickException: When all four tiers are absent. The message
+            names both recovery paths (``adingest use <slug>`` to set a
+            default, or ``--project <slug>`` to override per-invocation)
+            and points at ``adingest projects`` for the list of configured
+            slugs.
+    """
+    global _ACTIVE_PROJECT_CACHE
+
+    # R1 MED#2 contract: check ``explicit`` FIRST (before cache short-circuit).
+    # If cache is empty AND explicit is provided, the explicit wins and
+    # populates the cache. If cache is set AND explicit is provided, the
+    # explicit is IGNORED silently — production never re-resolves.
+    if _ACTIVE_PROJECT_CACHE is not None:
+        return _ACTIVE_PROJECT_CACHE
+
+    if explicit is not None:
+        _validate_slug(explicit)
+        _ACTIVE_PROJECT_CACHE = explicit
+        return explicit
+
+    env_value = os.environ.get("ADINGEST_PROJECT")
+    if env_value:
+        # Validate slug — guards against typos / shell-injection. Loud
+        # failure surfaces an operator-readable UsageError naming the
+        # offending env-var-derived slug.
+        _validate_slug(env_value)
+        _ACTIVE_PROJECT_CACHE = env_value
+        return env_value
+
+    state_value = _read_state_active(home)
+    if state_value is not None:
+        _ACTIVE_PROJECT_CACHE = state_value
+        return state_value
+
+    raise click.ClickException(
+        "no active project; run `adingest use <slug>` or pass "
+        "--project <slug> (see `adingest projects` for the list)"
+    )
+
+
+def _source_project_env(slug: str, home: Path = ADINGEST_HOME) -> None:
+    """Source ``~/.adingest/<slug>/.env`` into ``os.environ`` (setdefault).
+
+    Loads per-caller secrets so the ``${VAR}`` references in the per-caller
+    ``config.toml`` resolve cleanly during ``_interpolate_env_recursive``.
+    ``os.environ.setdefault`` semantics: shell env wins over the file (an
+    operator-set ``LP_SECRET_KEY=...`` in the shell takes precedence over the
+    file value).
+
+    Parser shape mirrors ``_load_env_client`` (which is removed in Step 9):
+    ``KEY=value`` lines, ``#`` comments, blank lines skipped, surrounding
+    quotes stripped, malformed lines silently skipped.
+
+    Security: emits a stderr warning (NOT an error — operator can still
+    proceed) if the ``.env`` file's mode is looser than 0600. Tightening
+    is the operator's responsibility; we don't mutate the mode silently
+    because that could mask a deliberate ACL the operator chose to set.
+
+    Args:
+        slug: Validated project slug. Caller is responsible for slug
+            validation (typically via ``resolve_active_project`` which
+            validates each cascade tier).
+        home: Project home dir. Defaults to ``ADINGEST_HOME`` module
+            constant; tests inject a ``tmp_path``.
+
+    Side effects:
+        Mutates ``os.environ`` via ``setdefault`` for each parsed line.
+        Emits a stderr warning if file mode is looser than 0600.
+    """
+    env_path = home / slug / ".env"
+    if not env_path.exists():
         return
-    for raw in path.read_text().splitlines():
+
+    # Mode check: warn (not error) if looser than 0600.
+    # ``stat.S_IMODE`` masks off the file-type bits, leaving only the
+    # permission bits. We compare against ``0o600`` directly — any group
+    # or world bit set means the secrets file is over-permissive.
+    mode = env_path.stat().st_mode & 0o777
+    if mode & 0o077:
+        click.echo(
+            f"warning: {env_path} has mode {oct(mode)}; "
+            f"recommend tightening to 0600 (chmod 600 {env_path})",
+            err=True,
+        )
+
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
+        # Strip surrounding quotes (single or double) — matches the
+        # ``_load_env_client`` shape and the operator-facing convention
+        # of quoting values that contain special characters.
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
@@ -630,9 +1287,62 @@ class UpgradeFlow:
 # --- Click CLI entry point --------------------------------------------------
 
 
-def _build_config(url: str | None, token: str | None, apps_file: str | None) -> AdingestConfig:
-    _load_env_client()
-    cfg = AdingestConfig.from_env()
+def _build_config(
+    project: str | None,
+    url: str | None,
+    token: str | None,
+    apps_file: str | None,
+) -> AdingestConfig:
+    """Build an ``AdingestConfig`` from the active project's TOML + flag overrides.
+
+    Step 9 of core-cli-config-refactor: replaces the legacy
+    ``_load_env_client`` → ``AdingestConfig.from_env`` env-var pipeline with
+    the TOML-backed cascade.
+
+    Pipeline:
+
+    1. ``resolve_active_project(explicit=project)`` — pick the slug via the
+       Step-5 cascade (``--project`` flag → ``$ADINGEST_PROJECT`` env →
+       ``state.toml`` → loud failure)
+    2. ``_source_project_env(slug)`` — source ``~/.adingest/<slug>/.env`` into
+       ``os.environ`` (setdefault; shell wins) so the per-caller TOML's
+       ``${VAR}`` references resolve during interpolation
+    3. ``load_config(slug)`` — read global + per-caller TOML, deep-merge,
+       interpolate ``${VAR}``, translate to ``AdingestConfig``
+    4. Apply ``--url`` / ``--token`` / ``--apps`` flag overrides via
+       ``dataclasses.replace`` on the frozen dataclass
+
+    Args:
+        project: ``--project <slug>`` flag value (highest cascade precedence),
+            or ``None`` when the flag isn't supplied.
+        url: ``--url`` override; takes final precedence over TOML's
+            ``[ingest_api].url``.
+        token: ``--token`` override; takes final precedence over TOML's
+            ``[ingest_api].token``.
+        apps_file: ``--apps <path>`` override; reads a JSON file and replaces
+            the TOML-derived ``apps`` list wholesale (legacy ``APPS_JSON`` env
+            shape is gone — operators use the TOML ``[[apps]]`` form or this
+            override path).
+
+    Returns:
+        A new ``AdingestConfig`` instance with overrides applied (or the
+        loader's output unchanged when no overrides are supplied).
+
+    Raises:
+        click.ClickException: When the cascade can't resolve an active
+            project (no flag, no env, no ``state.toml``) — message names
+            both recovery paths. Also propagates loader errors (missing
+            per-caller ``config.toml``, malformed TOML, missing ``${VAR}``).
+    """
+    # Read ``ADINGEST_HOME`` fresh at call time so test ``monkeypatch.setattr``
+    # on the module constant takes effect; ``resolve_active_project`` /
+    # ``_source_project_env`` / ``load_config`` would otherwise bind to the
+    # default-arg value captured at function-DEFINITION time. Mirrors the
+    # walkup commands' fresh-read pattern (Step 6: ``projects`` / ``current``).
+    home = ADINGEST_HOME
+    slug = resolve_active_project(explicit=project, home=home)
+    _source_project_env(slug, home=home)
+    cfg = load_config(slug, home=home)
     overrides: dict[str, Any] = {}
     if url:
         overrides["url"] = url
@@ -667,7 +1377,21 @@ def _emit(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
 
 
 def _common(f: Any) -> Any:
+    """Shared option decorator for data-touching commands.
+
+    Step 9 of core-cli-config-refactor: ``--project`` lands as the first
+    option per R1 LOW#5 (Item 4) — Click renders options in decoration order,
+    and ``--project`` is the highest-precedence cascade tier so listing it
+    first matches the conceptual hierarchy in ``--help`` output. The flag's
+    value is threaded into ``_build_config(project=...)`` by each command
+    body, where it becomes the ``explicit`` argument to
+    ``resolve_active_project``.
+    """
     for opt in reversed((
+        click.option(
+            "--project", default=None,
+            help="Override active project (default: from state.toml or ADINGEST_PROJECT env)",
+        ),
         click.option("--url", default=None, help="Override INGEST_API_URL"),
         click.option("--token", default=None, help="Override INGEST_API_TOKEN"),
         click.option("--json", "as_json", is_flag=True, help="Emit raw JSON (with verdicts)"),
@@ -692,9 +1416,10 @@ def cli() -> None:
               help="JSON file with apps[]")
 @_common
 def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_file: str | None,
-           url: str | None, token: str | None, as_json: bool, quiet: bool) -> None:
+           project: str | None, url: str | None, token: str | None,
+           as_json: bool, quiet: bool) -> None:
     """POST one ingest for EVENT_DATE (YYYY-MM-DD)."""
-    cfg = _build_config(url, token, apps_file)
+    cfg = _build_config(project, url, token, apps_file)
     client = AdingestClient(cfg)
     resp = client.post_ingest(event_date, _resolve_source(source, stub), cfg.apps)
     if poll and resp.get("job_id"):
@@ -713,7 +1438,7 @@ def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_fil
 @_common
 def range_cmd(
     date_range: str, poll: bool, source: str | None, stub: bool, apps_file: str | None,
-    continue_on_failure: bool, url: str | None, token: str | None,
+    continue_on_failure: bool, project: str | None, url: str | None, token: str | None,
     as_json: bool, quiet: bool,
 ) -> None:
     """Fire one ingest per day in START..END (inclusive)."""
@@ -723,7 +1448,7 @@ def range_cmd(
     start, end = date.fromisoformat(start_s), date.fromisoformat(end_s)
     if end < start:
         raise click.UsageError("END date must be >= START date")
-    cfg = _build_config(url, token, apps_file)
+    cfg = _build_config(project, url, token, apps_file)
     src = _resolve_source(source, stub)
     client = AdingestClient(cfg)
     for day in _iter_dates(start, end):
@@ -738,17 +1463,19 @@ def range_cmd(
 @cli.command()
 @click.argument("job_id")
 @_common
-def status(job_id: str, url: str | None, token: str | None, as_json: bool, quiet: bool) -> None:
+def status(job_id: str, project: str | None, url: str | None, token: str | None,
+           as_json: bool, quiet: bool) -> None:
     """GET status for JOB_ID."""
-    cfg = _build_config(url, token, None)
+    cfg = _build_config(project, url, token, None)
     resp = AdingestClient(cfg).get_job(job_id)
     _emit(resp, as_json, quiet)
 
 
 @cli.command()
+@click.option("--project", default=None, help="Override active project")
 @click.option("--url", default=None, help="Override INGEST_API_URL")
 @click.option("--token", default=None, help="Override INGEST_API_TOKEN")
-def upgrade(url: str | None, token: str | None) -> None:
+def upgrade(project: str | None, url: str | None, token: str | None) -> None:
     """Upgrade the installed CLI via the service manifest + GitHub mirror.
 
     Drives the 9-step universal upgrade flow (see :class:`UpgradeFlow`):
@@ -759,10 +1486,778 @@ def upgrade(url: str | None, token: str | None) -> None:
 
     Same code path works against any substrate (localhost uvicorn today,
     AWS App Runner tomorrow) because the manifest contract is wire-stable.
+
+    Step 10 of core-cli-config-refactor: ``upgrade`` uses INLINE decorators
+    (NOT the shared ``_common`` decorator that ``ingest`` / ``range`` /
+    ``status`` use), so ``--project`` is added here as its own
+    ``@click.option`` rather than inherited. The flag is threaded through
+    ``_build_config(project, url, token, None)`` to the same 4-arg signature
+    Step 9 established; the manifest URL is then resolved from the selected
+    project's ``[ingest_api].url`` (per-caller TOML overlay over global —
+    so a staging project can point at a staging manifest endpoint without
+    disturbing the production cron's manifest source).
     """
-    cfg = _build_config(url, token, None)
+    cfg = _build_config(project, url, token, None)
     flow = UpgradeFlow(cfg)
     flow.run()
+
+
+# --- Walkup commands: projects / use / current -----------------------------
+#
+# Step 6 of core-cli-config-refactor. First operator-facing surface change of
+# the refactor. Three read/write commands operating on ``~/.adingest/``:
+#
+#   * ``projects`` (ls)  — list configured callers; mark active with ``*``
+#   * ``use <slug>`` (cd) — set active caller (writes ``state.toml`` atomically)
+#   * ``current`` (pwd)   — print the active caller's slug
+#
+# All three commands use the Step-5 cascade (``resolve_active_project``) as the
+# single source of truth for "which slug is active right now" — so env / state
+# precedence is consistent across the walkup quartet AND the data-touching
+# commands rewritten in Step 9 (``ingest`` / ``range`` / ``status`` / ``upgrade``).
+#
+# Important: ``projects`` calls ``resolve_active_project()`` purely to compute
+# the ``*`` active-marker — and narrows the resulting ``ClickException`` catch
+# to ONLY the "no active project" sentinel string. Any OTHER ClickException
+# (e.g., the malformed-``state.toml`` raise from ``_read_state_active`` per R1
+# MED#1) re-propagates loudly. Catching ``ClickException`` broadly would
+# silently swallow the data-corruption signal — the opposite of the loud-failure
+# contract Step 4 established.
+
+
+@cli.command()
+def projects() -> None:
+    """List configured callers under ``~/.adingest/``; mark the active one with ``*``.
+
+    Scans ``~/.adingest/*/config.toml`` and prints each slug on its own line,
+    sorted alphabetically. The active slug (per the Step-5 cascade —
+    ``$ADINGEST_PROJECT`` env > ``state.toml`` active) is prefixed with ``*``;
+    non-active slugs get a leading space for column alignment.
+
+    Errors loudly if no projects are configured (``~/.adingest/`` doesn't
+    exist OR contains zero ``<slug>/config.toml`` files), naming the
+    ``adingest init <slug>`` bootstrap command in the message.
+
+    Active-marker resolution uses ``resolve_active_project()`` rather than a
+    parallel ``state.toml`` read so this command and the data-touching commands
+    share one source of truth for "which slug is active." If the cascade itself
+    fails with "no active project" (no flag, no env, no ``state.toml``), the
+    list still renders — no slug gets the ``*`` marker. Any OTHER cascade
+    failure (e.g., malformed ``state.toml``) re-raises loudly so the operator
+    sees the corruption signal.
+    """
+    home = ADINGEST_HOME
+    # Empty home: doesn't exist OR exists with zero <slug>/config.toml files.
+    if not home.exists():
+        raise click.ClickException(
+            f"no projects configured at {home}; "
+            f"run `adingest init <slug>` to bootstrap"
+        )
+    slugs = sorted(
+        d.name
+        for d in home.iterdir()
+        if d.is_dir() and (d / "config.toml").exists()
+    )
+    if not slugs:
+        raise click.ClickException(
+            f"no projects configured at {home}; "
+            f"run `adingest init <slug>` to bootstrap"
+        )
+
+    # Resolve active via the cascade (single source of truth). Narrow the
+    # catch: only the "no active project" sentinel is swallowed — any other
+    # ClickException (e.g., malformed state.toml) re-propagates. Broadening
+    # the catch would silently swallow the corruption signal that Step 4's
+    # loud-failure contract in ``_read_state_active`` establishes.
+    #
+    # ``home=home`` is passed explicitly (not relying on the function's
+    # default-arg binding) because Python evaluates default-args at function
+    # DEFINITION time. The module-level ``ADINGEST_HOME`` constant can be
+    # patched at runtime (tests via ``monkeypatch.setattr``); reading the
+    # module attribute inside the command body picks up the patched value,
+    # but the called helper would otherwise see its frozen default.
+    try:
+        active: str | None = resolve_active_project(home=home)
+    except click.ClickException as e:
+        if "no active project" in str(e):
+            active = None
+        else:
+            raise
+
+    for slug in slugs:
+        marker = "*" if slug == active else " "
+        click.echo(f"{marker} {slug}")
+
+
+@cli.command()
+@click.argument("slug")
+def use(slug: str) -> None:
+    """Set the active caller to ``SLUG`` (writes ``~/.adingest/state.toml``).
+
+    Validates the slug shape (alphanumeric + interior hyphens), verifies that
+    ``~/.adingest/<slug>/config.toml`` exists (refuses to point ``state.toml``
+    at an uninitialized caller), then writes the new active pointer
+    atomically via ``write_state_active`` (POSIX-atomic ``os.replace`` per
+    Step 4).
+
+    Echoes the new active slug. When the prior active was a different slug,
+    the echo carries a ``(was: <prior>)`` suffix so the operator sees the
+    transition; re-``use``-ing an already-active slug omits the suffix
+    (the prior == new case is silent on prior per the design's line 397 contract).
+    """
+    _validate_slug(slug)
+    # Read ``ADINGEST_HOME`` fresh at call time so test ``monkeypatch.setattr``
+    # is honored — default-arg binding of helpers is frozen at definition time,
+    # so all calls below pass ``home=home`` explicitly.
+    home = ADINGEST_HOME
+    if not (home / slug / "config.toml").exists():
+        raise click.ClickException(
+            f"project {slug!r} not initialized "
+            f"(no {home / slug / 'config.toml'}; "
+            f"run `adingest init {slug}` first)"
+        )
+
+    # Read prior active silently — ``_read_state_active`` returns None on
+    # absent state.toml AND raises loudly on malformed. We let the raise
+    # propagate (corruption signal); None just suppresses the (was: ...)
+    # suffix below.
+    prior = _read_state_active(home)
+    write_state_active(slug, home=home)
+
+    if prior and prior != slug:
+        click.echo(f"Active project: {slug}  (was: {prior})")
+    else:
+        click.echo(f"Active project: {slug}")
+
+
+@cli.command()
+def current() -> None:
+    """Print the active caller's slug (cascade-resolved).
+
+    Resolves via the standard cascade: ``--project`` flag (not applicable
+    here — ``current`` doesn't take ``--project``) → ``$ADINGEST_PROJECT``
+    env → ``~/.adingest/state.toml`` active → error.
+
+    Raises loudly with the exact remediation message when no caller is
+    active (the cascade's tier-4 ``ClickException``). The error message
+    names both recovery paths (``adingest use <slug>`` for persistent
+    default, ``--project <slug>`` for per-invocation override) AND points
+    at ``adingest projects`` for the list of configured slugs.
+    """
+    # Pass ``home=ADINGEST_HOME`` explicitly so the (potentially patched)
+    # module-level constant flows through — default-arg binding is frozen
+    # at function definition time and would otherwise bypass test overrides.
+    click.echo(resolve_active_project(home=ADINGEST_HOME))
+
+
+# --- Walkup command: init ---------------------------------------------------
+#
+# Step 7 of core-cli-config-refactor. Completes the walkup quartet by
+# bootstrapping a new caller dir under ``~/.adingest/<slug>/`` with a
+# template ``config.toml`` (``${VAR}`` placeholders for secrets, blank
+# strings for structural fields the operator must fill) + an empty,
+# mode-0600 ``.env`` scaffold + auto-activate if no current active.
+#
+# Two branches:
+#
+#   * Bare ``init <slug>``                — template branch (this step)
+#   * ``init <slug> --from-env-client X`` — migration branch (wired in Step 12)
+#
+# Auto-activate (per E2 H1): after the if/else, if ``state.toml`` has no
+# active slug (``_read_state_active`` returns None), this step's ``init``
+# writes ``state.toml`` so the just-created slug becomes the active one.
+# Subsequent ``init`` calls (when an active is already set) do NOT change
+# state.toml — the operator picks the active slug deliberately via ``use``.
+#
+# The template ``config.toml`` is intentionally MINIMAL — it carries the
+# structural sections (``[ingest_api]``, ``[levelplay]``, ``[bq]``) with
+# ``${VAR}`` placeholders for the secret fields the migration branch
+# (Step 11) will reference. The ``[[apps]]`` block is NOT pre-populated
+# (init has no knowledge of which apps the caller will host); a commented
+# stub at the end of the file points the operator at the goal-doc for the
+# per-app shape.
+
+
+def _write_template_config(target_dir: Path, slug: str) -> None:
+    """Write a template ``config.toml`` + empty ``.env`` to ``target_dir``.
+
+    Materializes the per-caller scaffolding for ``adingest init <slug>``'s
+    bare-template branch. The ``config.toml`` carries the three structural
+    sections (``[ingest_api]``, ``[levelplay]``, ``[bq]``) with ``${VAR}``
+    placeholders for the secret fields (per Step 11's ``_SECRET_TO_TOML``
+    map: ``LP_SECRET_KEY``, ``LP_REFRESH_TOKEN``); structural fields
+    (``url``, ``project_id``, ``dataset``, ``sa_key_path``) are blank
+    strings the operator fills via editor. A commented stub at the end of
+    the file directs the operator at the goal-doc's "What the operator
+    actually edits" section for the per-app ``[[apps]]`` shape.
+
+    The companion ``.env`` is empty except for commented secret-var hints
+    (``# LP_SECRET_KEY=`` etc.) so the operator sees the var names they're
+    expected to fill in but no real values leak as defaults. Mode 0600
+    chmod is applied AFTER the atomic write — keeps test parity with the
+    migration branch (Step 11) which also lands at 0600.
+
+    Both writes go through ``_atomic_write_text`` (Step 4 helper) so the
+    durability contract is uniform across template and migration branches.
+    The ``[[apps]]`` stub comment is appended to the dumped TOML string as
+    a raw line — ``tomli_w`` does not preserve standalone comments through
+    dict → string serialization.
+
+    Args:
+        target_dir: Per-caller directory (``~/.adingest/<slug>/``). Caller
+            (the ``init`` command body) creates this directory before
+            invoking this helper.
+        slug: Validated project slug. Used in the file-header comment so
+            the operator sees which caller this file is for when opening
+            it in an editor.
+    """
+    skeleton: dict[str, Any] = {
+        "ingest_api": {
+            "url": "",
+            "token": "",
+        },
+        "levelplay": {
+            "secret_key": "${LP_SECRET_KEY}",
+            "refresh_token": "${LP_REFRESH_TOKEN}",
+        },
+        "bq": {
+            "project_id": "",
+            "dataset": "",
+            "sa_key_path": "",
+        },
+    }
+
+    apps_stub_comment = (
+        "\n"
+        "# [[apps]] — add per-app blocks here; see "
+        'docs/core-cli-config-refactor-goal.md "What the operator actually edits" '
+        "for the per-app shape\n"
+    )
+
+    config_payload = (
+        f"# ~/.adingest/{slug}/config.toml\n"
+        f"# Per-caller config for {slug}; fill blank fields via editor.\n"
+        f"# Secrets stay in ~/.adingest/{slug}/.env (mode 0600); this file\n"
+        f"# references them via ${{VAR}} interpolation at CLI startup.\n"
+        f"\n"
+        + tomli_w.dumps(skeleton)
+        + apps_stub_comment
+    )
+
+    _atomic_write_text(target_dir / "config.toml", config_payload, target_dir)
+
+    # ``.env`` scaffold — secret var names commented out so the operator
+    # sees what's expected but no defaults leak. Mode 0600 set after
+    # write (``_atomic_write_text`` writes via os.open with mode 0o644).
+    env_payload = (
+        f"# ~/.adingest/{slug}/.env  (mode 0600 — CLI warns on looser perms)\n"
+        f"# Fill these in with the real values; CLI auto-sources at startup.\n"
+        f"\n"
+        f"# INGEST_API_TOKEN=...\n"
+        f"# LP_SECRET_KEY=...\n"
+        f"# LP_REFRESH_TOKEN=...\n"
+        f"# GA4_API_SECRET=...\n"
+    )
+
+    env_path = target_dir / ".env"
+    _atomic_write_text(env_path, env_payload, target_dir)
+    os.chmod(env_path, 0o600)
+
+
+# --- Migration helpers: `.env.client` → per-caller TOML + .env -------------
+#
+# Step 11 of core-cli-config-refactor. Translates a legacy ``.env.client``
+# (the pre-refactor cwd-coupled env-file) into the new ``~/.adingest/<slug>/``
+# layout:
+#
+#   * Structural KEY=value lines → per-caller ``config.toml`` (literal value
+#     under the mapped ``[section].key``)
+#   * Secret KEY=value lines     → per-caller ``.env`` (literal value);
+#                                   ``${KEY}`` REFERENCE in per-caller TOML
+#   * ``INGEST_API_URL``         → GLOBAL ``~/.adingest/config.toml`` as
+#                                   LITERAL under ``[ingest_api].url``
+#   * ``INGEST_API_TOKEN``       → per-caller ``.env`` as LITERAL +
+#                                   global ``[ingest_api].token = "${INGEST_API_TOKEN}"``
+#                                   REFERENCE (token literal NEVER lands in
+#                                   any ``config.toml``)
+#   * ``APPS_JSON``              → per-caller TOML's ``[[apps]]`` table-array
+#                                   with nested ``[apps.ga4]`` preserved per
+#                                   D14; literal ``ga4.api_secret`` extracted
+#                                   into ``.env`` as ``GA4_API_SECRET``
+#   * ``LP_TEST_*``              → SKIPPED with stderr note (test-scope
+#                                   segregation per D16 / Goal 4 — writing
+#                                   test creds to a prod caller's ``.env``
+#                                   would re-introduce the namespace
+#                                   pollution the refactor exists to fix)
+#   * Unrecognized               → stderr warning, line skipped
+#
+# Pre-flight required-key checks: ``INGEST_API_URL`` AND ``INGEST_API_TOKEN``
+# MUST be present in the input ``.env.client`` BEFORE any file writes happen.
+# A missing required key fails LOUDLY before the migration mutates the
+# filesystem — guarantees ``~/.adingest/<slug>/`` is never left
+# half-initialized (which would require ``rm -rf`` to recover).
+#
+# Global TOML side: every routing decision that touches the global file
+# accumulates into an in-memory ``global_doc`` dict; a SINGLE end-of-loop
+# ``_merge_global_config`` call does the only global-side write. Avoids the
+# per-key-call footgun where ``_merge_global_config`` would re-read +
+# re-write on each key.
+
+
+#: Structural env-vars → ``(TOML section, key)`` mapping. Values land LITERAL
+#: in per-caller ``config.toml``. The legacy ``BQ_TEST_*`` shell-side names
+#: rename to ``BQ_*`` in the migrated TOML per D11 (cutover-time rename); the
+#: shell env-var names themselves remain ``BQ_TEST_*`` per D16 for the test
+#: namespace's continuity. ``INGEST_API_URL`` is special-cased in
+#: ``_migrate_from_env_client`` (routes to GLOBAL TOML, not per-caller) and
+#: therefore is NOT included in this map.
+_ENV_VAR_TO_TOML: dict[str, tuple[str, str]] = {
+    "BQ_TEST_PROJECT_ID":  ("bq", "project_id"),
+    "BQ_TEST_DATASET":     ("bq", "dataset"),
+    "BQ_TEST_SA_KEY_PATH": ("bq", "sa_key_path"),
+}
+
+#: Secret env-vars that get a ``${VAR}`` REFERENCE written into per-caller
+#: ``config.toml`` (the literal value lands in per-caller ``.env``). Note:
+#: ``INGEST_API_TOKEN`` is NOT here — it has its own routing branch (per-caller
+#: ``.env`` literal + global TOML ``${INGEST_API_TOKEN}`` reference, NOT
+#: per-caller TOML reference); ``GA4_API_SECRET`` is NOT here either — its
+#: reference lives PER-APP at ``apps[*].ga4.api_secret`` and is handled inside
+#: the ``APPS_JSON`` branch of the migration loop.
+_SECRET_TO_TOML: dict[str, tuple[str, str]] = {
+    "LP_SECRET_KEY":    ("levelplay", "secret_key"),
+    "LP_REFRESH_TOKEN": ("levelplay", "refresh_token"),
+}
+
+#: Non-token per-caller secrets that land LITERAL in per-caller ``.env``.
+#: ``INGEST_API_TOKEN`` is handled by its own routing branch (the token literal
+#: still lands in per-caller ``.env``, but the routing also writes a global TOML
+#: reference — separate concerns). ``GA4_API_SECRET`` lands in ``.env`` via the
+#: ``APPS_JSON`` branch (literal ``ga4.api_secret`` value is extracted from the
+#: parsed apps list).
+_SECRET_ENV_VARS: set[str] = {"LP_SECRET_KEY", "LP_REFRESH_TOKEN", "GA4_API_SECRET"}
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a KEY=value env file into a ``dict[str, str]``.
+
+    Same line-loop semantics as :func:`_source_project_env` (the runtime
+    secrets loader for ``~/.adingest/<slug>/.env``): ``KEY=value`` lines,
+    ``#`` comments, blank lines skipped, surrounding single/double quotes
+    stripped from the value, malformed lines (no ``=``) silently skipped.
+
+    The migration branch consumes this to read the legacy ``.env.client`` into
+    a flat dict; :func:`_migrate_from_env_client` then routes each key
+    according to ``_ENV_VAR_TO_TOML`` / ``_SECRET_TO_TOML`` / the special-case
+    branches.
+
+    Args:
+        path: Path to the env file. Caller is responsible for existence
+            (Click's ``type=click.Path(exists=True)`` on ``init``'s flag
+            handles this in production; tests use real fixture files).
+
+    Returns:
+        Flat dict mapping the parsed KEY to its stripped value.
+    """
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
+def _merge_global_config(home: Path, ingest_api_dict: dict[str, str]) -> None:
+    """Merge ``[ingest_api]`` values into the global ``~/.adingest/config.toml``.
+
+    Reads the existing global config (or starts from empty when absent),
+    deep-merges the caller-supplied ``ingest_api_dict`` under the
+    ``[ingest_api]`` section, and atomic-writes the result via the shared
+    :func:`_atomic_write_text` helper (Step 4 durability parity).
+
+    Asymmetry contract (caller-side): ``url`` is passed as a LITERAL value
+    (e.g., ``"https://api.creational.ai"``) because URLs are not secrets;
+    ``token`` is passed as the verbatim string ``"${INGEST_API_TOKEN}"`` — the
+    REFERENCE, not the literal token. The global TOML never carries the token
+    literal; the literal lives only in per-caller ``.env``. This matches the
+    goal-doc's secret-separation contract (lines 162 + 200).
+
+    Args:
+        home: ``ADINGEST_HOME`` (or a test ``tmp_path``). The function does
+            NOT create ``home`` — caller is expected to have invoked
+            ``home.mkdir(parents=True, exist_ok=True)`` already (e.g., via
+            ``write_state_active`` or ``init``'s ``target_dir.mkdir``).
+        ingest_api_dict: Mapping with ``"url"`` and/or ``"token"`` keys.
+            Both optional; only the present keys are merged.
+    """
+    global_path = home / "config.toml"
+    existing = _read_toml_if_exists(global_path)
+    merged = _deep_merge(existing, {"ingest_api": ingest_api_dict})
+    _atomic_write_text(global_path, tomli_w.dumps(merged), home)
+
+
+def _migrate_from_env_client(
+    env_client_path: Path,
+    target_dir: Path,
+    home: Path = ADINGEST_HOME,
+) -> None:
+    """Translate a legacy ``.env.client`` into the new ``~/.adingest/<slug>/`` layout.
+
+    Routes each parsed KEY=value pair according to the classification maps
+    (``_ENV_VAR_TO_TOML`` / ``_SECRET_TO_TOML`` / ``_SECRET_ENV_VARS``) plus the
+    four special-case branches (``INGEST_API_URL``, ``INGEST_API_TOKEN``,
+    ``APPS_JSON``, ``LP_TEST_*``). Writes three artifacts:
+
+    1. Per-caller ``config.toml`` — structural values + ``${VAR}`` references
+       for secrets (atomic write via :func:`_atomic_write_text`)
+    2. Per-caller ``.env`` — secret literals (mode 0600 via ``os.chmod`` after
+       the atomic write)
+    3. Global ``~/.adingest/config.toml`` — ``[ingest_api].url`` literal +
+       ``[ingest_api].token`` reference (single end-of-loop merge via
+       :func:`_merge_global_config`)
+
+    Pre-flight required-key checks run BEFORE any file writes — a missing
+    ``INGEST_API_URL`` or ``INGEST_API_TOKEN`` fails LOUDLY before the
+    migration mutates the filesystem. This guarantees ``target_dir`` is never
+    left half-initialized (which would require ``rm -rf ~/.adingest/<slug>/``
+    to recover).
+
+    ``APPS_JSON`` shape preservation per D14: nested ``[apps.ga4]`` sub-dicts
+    are preserved as-is; literal ``ga4.api_secret`` values are extracted into
+    the ``.env`` bucket as ``GA4_API_SECRET`` and replaced in the parsed app
+    dict with the string ``"${GA4_API_SECRET}"``. XOR validator-respect:
+    whichever of ``measurement_id`` / ``firebase_app_id`` the input populates
+    is copied through; the missing one is NOT synthesized.
+
+    ``LP_TEST_*`` lines are SKIPPED (not written to the migrated slug's
+    ``.env``) — writing them would re-introduce the prod/test namespace
+    pollution Goal 4 set out to fix (per D16). A stderr note directs the
+    operator at ``init test`` or manual edit of ``~/.adingest/test/.env``.
+
+    Args:
+        env_client_path: Path to the legacy ``.env.client``. Caller (the
+            ``init`` command body in Step 12, or a test) is responsible for
+            existence (Click's ``type=click.Path(exists=True)`` handles it
+            in production).
+        target_dir: Per-caller dir (``~/.adingest/<slug>/``). Caller creates
+            this before invoking; the function writes ``config.toml`` +
+            ``.env`` into it.
+        home: Global config home. The global ``config.toml`` is written
+            (or merged into) at ``home / "config.toml"``. Defaults to
+            ``ADINGEST_HOME`` module constant; tests inject a ``tmp_path``.
+
+    Raises:
+        click.ClickException: When ``INGEST_API_URL`` or ``INGEST_API_TOKEN``
+            is missing from the input ``.env.client``. Pre-flight check; no
+            partial-state corruption.
+    """
+    parsed = _parse_env_file(env_client_path)
+
+    # Pre-flight required-key checks BEFORE any file writes. If either is
+    # absent, raise loudly — partial migration would leave the operator
+    # with a broken ``~/.adingest/<slug>/`` that requires manual cleanup.
+    if "INGEST_API_URL" not in parsed:
+        raise click.ClickException(
+            "INGEST_API_URL required in .env.client for migration; "
+            "the global ~/.adingest/config.toml needs a base URL"
+        )
+    if "INGEST_API_TOKEN" not in parsed:
+        raise click.ClickException(
+            "INGEST_API_TOKEN required in .env.client for migration; "
+            "per-caller .env would be missing the service bearer token, "
+            "causing next CLI fire to 401"
+        )
+
+    # In-memory accumulators. Single end-of-loop write to each destination —
+    # no per-key fsync churn, no half-state-on-crash risk between branches.
+    toml_doc: dict[str, Any] = {}
+    secrets: dict[str, str] = {}
+    global_doc: dict[str, Any] = {}
+
+    for key, value in parsed.items():
+        if key == "APPS_JSON":
+            # Parse the JSON array; preserve nested ``ga4`` sub-dict shape
+            # per D14. For any literal ``ga4.api_secret`` (i.e., not already
+            # a ``${...}`` reference), extract the literal to ``.env`` as
+            # ``GA4_API_SECRET`` and replace with the reference string.
+            apps_raw = json.loads(value)
+            apps_out: list[dict[str, Any]] = []
+            for app in apps_raw:
+                # Shallow-copy the app so we don't mutate the parsed-JSON
+                # structure (defensive; the JSON parser already returns a
+                # fresh object, but explicit-copy keeps the intent clear).
+                app_out: dict[str, Any] = dict(app)
+                ga4 = app_out.get("ga4")
+                if isinstance(ga4, dict):
+                    ga4_out = dict(ga4)
+                    api_secret = ga4_out.get("api_secret")
+                    # Extract only LITERAL secrets — if the value is already
+                    # ``${VAR}``, leave it alone (idempotent re-migration).
+                    if (
+                        isinstance(api_secret, str)
+                        and not api_secret.startswith("${")
+                    ):
+                        secrets["GA4_API_SECRET"] = api_secret
+                        ga4_out["api_secret"] = "${GA4_API_SECRET}"
+                    app_out["ga4"] = ga4_out
+                apps_out.append(app_out)
+            toml_doc["apps"] = apps_out
+
+        elif key == "INGEST_API_URL":
+            # LITERAL value goes to GLOBAL TOML — URL is not a secret.
+            # Accumulator-only; final merge happens at end of loop.
+            global_doc.setdefault("ingest_api", {})["url"] = value
+
+        elif key == "INGEST_API_TOKEN":
+            # LITERAL value to per-caller ``.env`` (it IS a secret) AND a
+            # ``${INGEST_API_TOKEN}`` REFERENCE to GLOBAL TOML. The token
+            # literal NEVER lands in any ``config.toml`` (secret separation
+            # per goal-doc lines 162 + 200).
+            secrets["INGEST_API_TOKEN"] = value
+            global_doc.setdefault("ingest_api", {})["token"] = "${INGEST_API_TOKEN}"
+
+        elif key in _ENV_VAR_TO_TOML:
+            # Structural value → per-caller TOML literal under mapped section.
+            section, toml_key = _ENV_VAR_TO_TOML[key]
+            toml_doc.setdefault(section, {})[toml_key] = value
+
+        elif key in _SECRET_TO_TOML:
+            # Secret value → per-caller ``.env`` literal + per-caller TOML
+            # ``${KEY}`` REFERENCE.
+            section, toml_key = _SECRET_TO_TOML[key]
+            secrets[key] = value
+            toml_doc.setdefault(section, {})[toml_key] = f"${{{key}}}"
+
+        elif key in _SECRET_ENV_VARS:
+            # Non-token per-caller secrets that aren't TOML-referenced from a
+            # mapped section (currently empty after subtracting the
+            # ``_SECRET_TO_TOML`` keys above — kept as a defensive branch
+            # for forward-compat with future secret-only vars).
+            secrets[key] = value
+
+        elif key.startswith("LP_TEST_"):
+            # Test-scope segregation per D16 / Goal 4. Operator gets a clear
+            # stderr note rather than silent data-loss.
+            click.echo(
+                f"note: {key} belongs to test caller scope; "
+                f"populate ~/.adingest/test/.env separately via "
+                f"`adingest init test` or manual edit",
+                err=True,
+            )
+
+        else:
+            # Unrecognized var — stderr warning, line skipped. Loud enough
+            # to surface in CliRunner output, soft enough to not block the
+            # migration on forward-compat vars the operator may have added.
+            click.echo(
+                f"warning: unrecognized var {key}; skipped",
+                err=True,
+            )
+
+    # Per-caller ``config.toml`` — atomic write via Step 4 helper.
+    _atomic_write_text(
+        target_dir / "config.toml", tomli_w.dumps(toml_doc), target_dir,
+    )
+
+    # Per-caller ``.env`` — atomic write + chmod 0600. The ``.env`` format
+    # mirrors the operator-facing convention (``KEY=value`` lines, one per
+    # line, no comments / quotes — operators can edit directly). Sorting the
+    # keys keeps the output deterministic for test assertions.
+    env_lines = [f"{k}={v}\n" for k, v in sorted(secrets.items())]
+    env_payload = "".join(env_lines)
+    env_path = target_dir / ".env"
+    _atomic_write_text(env_path, env_payload, target_dir)
+    os.chmod(env_path, 0o600)
+
+    # Global ``config.toml`` — single merge call at end of loop. ``home`` is
+    # the parent of ``target_dir``; we let ``_merge_global_config`` handle
+    # the read-merge-write sequence so the existing global content (set up
+    # by an earlier ``init <other-slug>``) is preserved.
+    if global_doc:
+        home.mkdir(parents=True, exist_ok=True)
+        _merge_global_config(home, global_doc.get("ingest_api", {}))
+
+
+@cli.command()
+@click.argument("slug")
+@click.option(
+    "--from-env-client",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Migrate from a legacy .env.client file into the new ~/.adingest/<slug>/ layout.",
+)
+def init(slug: str, from_env_client: str | None) -> None:
+    """Bootstrap ``~/.adingest/<slug>/`` with a template config + empty .env.
+
+    Creates the per-caller directory and writes a template ``config.toml``
+    (``${VAR}`` placeholders for secrets; blank structural fields the
+    operator fills via editor) plus an empty, mode-0600 ``.env`` scaffold.
+
+    Auto-activate: if ``state.toml`` has no active slug after the
+    materialization, this command also writes ``state.toml`` so the
+    just-created slug becomes the active one. Subsequent ``init`` calls
+    (when an active is already set) do NOT change state.toml — operators
+    pick the active slug deliberately via ``adingest use``.
+
+    Refuses to overwrite an existing ``~/.adingest/<slug>/`` directory;
+    the operator must remove it manually if re-init is intended.
+
+    The ``--from-env-client <path>`` flag (Step 12) migrates a legacy
+    ``.env.client`` into the new layout via :func:`_migrate_from_env_client`
+    — translates the parsed ``KEY=value`` pairs into per-caller
+    ``config.toml`` + per-caller ``.env`` (mode 0600) + global
+    ``~/.adingest/config.toml``. Pre-flight required-key checks
+    (``INGEST_API_URL`` / ``INGEST_API_TOKEN``) fail BEFORE any file
+    writes so a missing-input migration never leaves the target dir
+    half-initialized. When the flag is omitted, the template branch
+    runs (``${VAR}`` placeholders for secrets; blank structural fields).
+    """
+    _validate_slug(slug)
+
+    # Read ``ADINGEST_HOME`` fresh at call time so test ``monkeypatch.setattr``
+    # is honored — default-arg binding of helpers is frozen at definition
+    # time, so all calls below pass ``home=home`` explicitly.
+    home = ADINGEST_HOME
+    target_dir = home / slug
+
+    if target_dir.exists():
+        raise click.ClickException(
+            f"{target_dir} already exists; refusing to overwrite "
+            f"(remove it manually and re-run init)"
+        )
+
+    target_dir.mkdir(parents=True)
+
+    if from_env_client is not None:
+        # Step 12 — replace Step 7's ``ClickException`` placeholder with the
+        # real migration helper landed in Step 11. ``_migrate_from_env_client``
+        # runs its own pre-flight checks (``INGEST_API_URL`` /
+        # ``INGEST_API_TOKEN``) BEFORE any file writes, so a missing-input
+        # migration leaves the just-created ``target_dir`` empty (recoverable
+        # by ``rmdir`` since no files materialized; Click's exit-via-raise
+        # surfaces the loud-fail message to the operator).
+        _migrate_from_env_client(Path(from_env_client), target_dir, home=home)
+        click.echo(f"Initialized {slug} from {from_env_client}")
+    else:
+        _write_template_config(target_dir, slug)
+
+    # Auto-activate (per E2 H1): only when no current active. ``init``
+    # bootstrapping the very first caller should leave the operator with
+    # a usable ``adingest`` invocation without needing a separate
+    # ``adingest use``. Subsequent ``init`` calls (when an active is
+    # already set) preserve the operator's deliberate choice.
+    if _read_state_active(home) is None:
+        write_state_active(slug, home=home)
+        click.echo(f"Active project: {slug}")
+
+
+# --- `config` subgroup: `config show` --------------------------------------
+#
+# Step 8 of core-cli-config-refactor. Subgroup container per R1 MED#4 — keeps
+# future ``config edit`` / ``config path`` / ``config validate`` extensible
+# without re-architecting from ``@cli.command`` to ``@cli.group`` later.
+#
+# ``config show`` is the inspection surface for the caller config — resolves
+# the active project via the standard cascade (``--project`` override
+# honored), sources the per-caller ``.env`` (so ``${VAR}`` references inside
+# ``config.toml`` resolve through ``os.environ``), invokes ``load_config``,
+# and renders the resulting frozen :class:`AdingestConfig` as a rich Table.
+#
+# Output policy (per Open Question #2 in the design doc): secrets render
+# LITERAL, not redacted. Operators run ``config show`` to debug, and a
+# ``****`` mask would defeat the purpose; the file lives at mode 0600 under
+# ``~/.adingest/<slug>/.env`` and the operator is the only viewer.
+#
+# Apps list rendering (per Step 8 Specification + design Item 3): the
+# ``apps`` field is a list of dicts (each app's TOML structure carried
+# through verbatim per D14). Every leaf in every app dict gets its own
+# row with dot-notation key path — ``apps[0].app_id``, ``apps[0].ga4.api_secret``,
+# etc. No collapsing, no summarization — matches the no-redaction stance
+# from Open Question #2.
+#
+# Cache short-circuit interaction: Step 5's ``_ACTIVE_PROJECT_CACHE`` is a
+# process-lifetime cache. Each CLI invocation is a fresh process, so the
+# cache is always cold when ``config_show`` enters — ``explicit=project``
+# always wins. Tests that reuse the in-process module (CliRunner) must
+# call ``_invalidate_cache_for_tests()`` between invocations; the autouse
+# ``_reset_cache_between_tests`` fixture in ``test_core_cli_walkup.py``
+# handles this until Step 14 lifts it to conftest scope.
+
+
+@cli.group(name="config")
+def config_grp() -> None:
+    """Inspect/manage caller config under ``~/.adingest/``."""
+
+
+def _render_config_table(cfg: AdingestConfig) -> None:
+    """Render an :class:`AdingestConfig` to stdout as a rich ``Table``.
+
+    Two columns: ``Key`` (dot-notation path) and ``Value`` (literal resolved
+    value — secrets NOT redacted per Open Question #2 in the design doc).
+    Every dataclass field gets a row; the ``apps`` list nests one row per
+    leaf using ``apps[i].<key>`` (and ``apps[i].ga4.<key>`` for the nested
+    sub-table) path notation per design Item 3.
+
+    The renderer writes to a fresh :class:`Console` so output goes to
+    ``sys.stdout``; tests capture via ``CliRunner.invoke``'s output channel.
+
+    Args:
+        cfg: The validated config to render. Field order follows the
+            dataclass declaration order; ``apps`` is always rendered last.
+    """
+    from dataclasses import fields as dc_fields
+
+    console = Console()
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Key")
+    table.add_column("Value")
+
+    apps_field_name = "apps"
+    for f in dc_fields(cfg):
+        if f.name == apps_field_name:
+            continue
+        value = getattr(cfg, f.name)
+        table.add_row(f.name, str(value))
+
+    # ``apps`` last — nested rows per app and per nested sub-table.
+    apps: list[dict[str, Any]] = getattr(cfg, apps_field_name)
+    for i, app in enumerate(apps):
+        for k, v in app.items():
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    table.add_row(f"apps[{i}].{k}.{sub_k}", str(sub_v))
+            else:
+                table.add_row(f"apps[{i}].{k}", str(v))
+
+    console.print(table)
+
+
+@config_grp.command("show")
+@click.option(
+    "--project",
+    default=None,
+    help="Override cascade — show config for this slug instead of the active one.",
+)
+def config_show(project: str | None) -> None:
+    """Render the resolved caller config as a rich table.
+
+    Resolves the active slug via the standard cascade (``--project`` →
+    ``$ADINGEST_PROJECT`` → ``state.toml`` → error), sources the per-caller
+    ``.env``, loads + interpolates ``config.toml``, and renders the
+    resulting :class:`AdingestConfig` as a two-column rich Table.
+
+    Secrets are shown LITERAL (no redaction) per Open Question #2 — the
+    operator runs ``config show`` to debug and a mask would defeat the
+    purpose; secrets live at mode 0600 under ``~/.adingest/<slug>/.env``
+    and the operator is the sole viewer.
+    """
+    home = ADINGEST_HOME
+    slug = resolve_active_project(explicit=project, home=home)
+    _source_project_env(slug, home=home)
+    cfg = load_config(slug, home=home)
+    _render_config_table(cfg)
 
 
 if __name__ == "__main__":
