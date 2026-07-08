@@ -1,12 +1,13 @@
 # adingest
 
-Single-file CLI for the [ad-ingest](https://api.creational.ai) service. Fires ingests, polls jobs, renders an 8-category verdict per source.
+Single-file CLI for the [ad-ingest](https://api.creational.ai/adingest) service. Fires ingests, polls jobs, renders a 9-category verdict per source.
 
 * `adingest ingest 2026-05-12 --poll` — POST + poll + verdict-classified table, in one command
 * `adingest range 2026-05-10..2026-05-12 --poll` — backfill loop, one job per day
 * `adingest status <JOB_ID>` — re-render the table for an existing job
 * `adingest upgrade` — atomic self-replace via service manifest + sha256-verified bytes from this mirror
-* 8-category verdict classifier (`✅ healthy-fresh`, `🚨 silent-drop`, `⚠️ partial-dedup`, …) — one-glance health per source and per app-platform rollup
+* `adingest fetch-only 2026-05-12 --json` — pipeable canonical revenue rows on stdout, **zero writes** (no BQ, no GA4, no dedup); validate a caller's config with no destination credentials
+* 9-category verdict classifier (`✅ healthy-fresh`, `🚨 silent-drop`, `✅ fetch-only`, …) — one-glance health per source and per app-platform rollup
 * PEP 723 single-file Python script — [uv](https://docs.astral.sh/uv/) resolves inline deps on first run; no `pip install`, no virtualenv
 
 ## Table of Contents
@@ -16,6 +17,7 @@ Single-file CLI for the [ad-ingest](https://api.creational.ai) service. Fires in
 - [`adingest ingest`](#adingest-ingest)
 - [`adingest range`](#adingest-range)
 - [`adingest status`](#adingest-status)
+- [`adingest fetch-only`](#adingest-fetch-only)
 - [Verdict vocabulary](#verdict-vocabulary)
 - [`adingest upgrade`](#adingest-upgrade)
 - [Authentication and errors](#authentication-and-errors)
@@ -37,7 +39,7 @@ adingest --version
 ```
 
 ```
-adingest, version 0.1.0
+adingest, version 0.2.1
 ```
 
 Point it at a service — `adingest init <slug>` bootstraps `~/.adingest/<slug>/config.toml` + `.env` with template placeholders; edit those two files (see [Configuration](#configuration) below for the layout):
@@ -50,7 +52,7 @@ $ ${EDITOR:-vi} ~/.adingest/dev/config.toml    # set [ingest_api].url + [[apps]]
 $ ${EDITOR:-vi} ~/.adingest/dev/.env           # set INGEST_API_TOKEN=<bearer>
 ```
 
-First use — stub mode exercises the full wire path without upstream credentials:
+First use — stub mode exercises the full wire path without upstream credentials. ⚠ Stub adapters register only when the service runs with `env="dev"` — point `[ingest_api].url` at a local dev server (e.g. `http://localhost:8000`) for this flow; `--stub` errors against the production mount:
 
 ```bash
 $ adingest ingest 2026-05-12 --stub --poll
@@ -99,7 +101,7 @@ A minimal per-project `config.toml`:
 
 ```toml
 [ingest_api]
-url   = "https://api.creational.ai"     # also settable globally in ~/.adingest/config.toml
+url   = "https://api.creational.ai/adingest"   # the /adingest mount path is required; also settable globally in ~/.adingest/config.toml
 token = "${INGEST_API_TOKEN}"           # env-interpolated from ~/.adingest/<slug>/.env
 
 [[apps]]
@@ -157,7 +159,7 @@ GA4: attempted=0  sent=0  skipped_orphan=0  failed=0
 | `--poll` | Poll `GET /v1/jobs/{id}` every 2s until terminal (max 120s); render the table |
 | `--source NAME` | Source name (default: `levelplay`) |
 | `--stub` | Alias for `--source stub` — no upstream creds required |
-| `--apps FILE` | JSON file with `apps[]`; overrides `APPS_JSON` env |
+| `--apps FILE` | JSON file with `apps[]`; overrides the per-project TOML `[[apps]]` list |
 | `--url URL` | Override `INGEST_API_URL` |
 | `--token TOKEN` | Override `INGEST_API_TOKEN` |
 | `--json` | Emit raw JSON (with `verdicts: [...]` merged in at every scope) instead of the table |
@@ -208,6 +210,90 @@ GA4: attempted=955  sent=949  skipped_orphan=6  failed=0
 | `--json` | Emit raw JSON (with verdicts) |
 | `--quiet` | Suppress non-verdict output |
 
+## `adingest fetch-only`
+
+Run the same faithful pipe as `ingest` — adapter fetch → validation → match remap — but **stop before the sinks**: no BigQuery write, no GA4 fan-out, no dedup query. The day's canonical revenue rows come back as pipeable JSON on stdout; counters and verdicts go to stderr. Two operator wins: pull a day of rows without provisioning any destination, and validate a caller's config (LP creds, per-app `match` remap, row validity) end-to-end with **zero writes and zero destination credentials**.
+
+It **always polls** (rows only exist at the terminal job, so a fire-and-forget fetch-only is meaningless) — there is no `--poll` flag.
+
+```bash
+$ adingest fetch-only --project hexario 2026-07-06 --json > rows.json        # rows to a file
+$ adingest fetch-only --project hexario 2026-07-06 --json | jq 'length'      # count the day's rows
+$ adingest fetch-only --project hexario 2026-07-06                           # human summary, no rows dump
+```
+
+> **⚠ Local-only until `core-job-registry-rds` lands.** The service's in-process job registry can silently lose the deliverable on the multi-instance production gateway — an unpinned instance may not hold the job the CLI polls back. Point `fetch-only` at a **local dev service** until the registry is externalized: a bare `--project hexario` resolves to `https://api.creational.ai/adingest` (prod) via the per-slug config, so pass `--url http://localhost:8000` to force local routing (and `--stub` to exercise the wire path without upstream LP creds).
+
+### Output contract (the piping surface)
+
+`--json` splits the two streams so redirection stays clean:
+
+- **stdout** — a bare JSON array of the day's rows (all sources concatenated; each row self-describes via its `source` field). `> rows.json` and `| jq …` both work with zero non-JSON contamination.
+- **stderr** — the same counters envelope `ingest --json` emits (verdicts merged), **minus the rows** (`rows_by_source` is stripped so the array is not duplicated into the envelope). `2>counters.json | jq` yields machine-readable verdicts — the only programmatic verdict channel in this mode, since stdout is rows-only by contract.
+
+```bash
+$ adingest fetch-only --project hexario --url http://localhost:8000 --stub 2026-07-06 --json \
+    > rows.json 2> counters.json
+$ jq 'length' rows.json                       # row count
+$ jq '.sources[].verdicts' counters.json      # ["fetch-only"] on a healthy slug
+```
+
+`--json --quiet` is **byte-clean**: the stderr envelope is suppressed too, so stdout carries pure rows and **stderr is empty**. Use this in cron/script pipelines that treat any stderr output as a failure signal:
+
+```bash
+$ adingest fetch-only --project hexario --url http://localhost:8000 --stub 2026-07-06 --json --quiet \
+    | jq 'length'
+```
+
+Without `--json`, human mode prints a per-source counters summary plus a rows-per-`(platform, app_id)` breakdown derived CLI-side from the returned rows — Use Case 2's routing check at a glance — and **never dumps the rows**:
+
+```
+Job ing_01KS7…  status=complete  1.9s
+Source: levelplay  fetched=1240  invalid=0  verdict=✅ fetch-only
+┏━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┓
+┃ platform ┃ app_id                       ┃ rows ┃
+┡━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━┩
+│ android  │ com.mochibits.hexario.google │ 812  │
+│ ios      │ com.mochibits.hexario.apple  │ 428  │
+└──────────┴──────────────────────────────┴──────┘
+```
+
+The writer-boundary columns (`skipped_dedup` / `inserted` / `orphan` / `%uid`) and the `GA4:` summary line are omitted in fetch-only mode — they would all read as a misleading `0` in a mode that provably never writes or publishes.
+
+### Exit codes (stricter than `ingest`)
+
+| Terminal status | `fetch-only` exit | stdout |
+|---|---|---|
+| `complete` (incl. empty day) | 0 | rows array (`[]` on an empty day — empty is a valid answer, not an error) |
+| `partial` (some sources failed) | non-zero | **surviving sources' rows still emitted** — `> rows.json \|\| alert` gets both the salvageable data and the alarm |
+| `failed` (all sources failed) | non-zero | `[]` |
+| non-terminal poll timeout | non-zero | `[]` |
+
+This is deliberately **stricter than `ingest` / `range`**, which exit `0` even on a `failed` job (their alarm is the `🚨` verdict tier in the rendered table, not the exit code). `fetch-only` makes the exit code the alarm so `> rows.json || alert` pipelines work directly. Unifying `ingest`'s exit behavior is out of scope — the divergence is per-verb by design.
+
+> Under `--json --quiet`, a `partial`/`failed` run exits non-zero with **no in-band diagnostic** — the stderr envelope that names the failed source is suppressed. The exit code is the only alarm; re-run without `--quiet` to see which source failed.
+
+### Flags
+
+| Flag | Behavior |
+|------|----------|
+| `--source NAME` | Source name (default: `levelplay`) |
+| `--stub` | Alias for `--source stub` — no upstream creds required (dev service only) |
+| `--apps FILE` | JSON file with `apps[]`; overrides the per-project TOML `[[apps]]` list |
+| `--url URL` / `--token TOKEN` | Override `INGEST_API_URL` / `INGEST_API_TOKEN` |
+| `--json` | Rows array → stdout, counters envelope → stderr |
+| `--quiet` | Suppress the stderr envelope (with `--json` → byte-clean stdout) |
+
+A **single ISO date only** — a `START..END` range string is rejected with a `UsageError` pointing at `range` (fetch-only has no multi-day loop). For multiple days, loop and merge the arrays:
+
+```bash
+$ for d in 2026-07-01 2026-07-02 2026-07-03; do
+    adingest fetch-only --project hexario --url http://localhost:8000 --stub "$d" --json --quiet
+  done | jq -s 'add'          # concatenate each day's array into one
+```
+
+> **Retention caveat.** fetch-only reads the same LevelPlay ILR source as `ingest` — LP retains only ~30 days of impression-level revenue. Dates older than that window return an upstream error/empty (surfaced as `adapter_fetch_failed`, not a silent `[]`); deep history still comes from a LevelPlay dashboard export. fetch-only is a *tap before the sinks*, not a history store.
+
 ## Verdict vocabulary
 
 Each source gets exactly one verdict per job, plus per-`(platform, app_id)` verdicts under the `by_app_platform` rollup. Precedence is two-axis: tier (`🚨 > ⚠️ > ✅`), then table order within tier.
@@ -222,17 +308,22 @@ Each source gets exactly one verdict per job, plus per-`(platform, app_id)` verd
 | 🚨 | `writer-orphan-heavy` | `rows_inserted_orphan` is a significant fraction of `rows_inserted` (BQ landed but no `user_id`) |
 | 🚨 | `ga4-orphan-heavy` | `ga4_events_skipped_orphan` is a significant fraction of `ga4_events_attempted` |
 | 🚨 | `silent-drop` | Counter-balance violation — `rows_fetched != rows_invalid + rows_skipped_dedup + rows_inserted`. Means a row vanished between fetch and BQ without classification. |
+| ✅ | `fetch-only` | A `fetch-only` job that fired neither `empty-upstream` nor `invalid-heavy` — the healthy fetch-only outcome: rows fetched and valid, nothing written by design. |
 
 > The tier emoji (`✅` / `⚠️` / `🚨`) is render-only — it shows in the table output. The JSON `verdicts` field carries just the bare name (e.g. `["healthy-fresh"]`).
+
+> **fetch-only mode.** On a `fetch-only` job only the two *pre-sink* triggers evaluate — `empty-upstream` and `invalid-heavy` (both computed from `rows_fetched` / `rows_invalid`, which fetch-only populates for real). The sink-boundary triggers (`healthy-fresh`, `healthy-dedup`, `partial-dedup`, `writer-orphan-heavy`, `ga4-orphan-heavy`, `silent-drop`) are suppressed — they are meaningless with no writer or publisher, and `silent-drop` in particular would false-positive on *every* successful fetch-only run (`rows_inserted == 0` by construction). When neither pre-sink trigger fires, the verdict is `fetch-only` ✅; when a caller's match rules drop rows the operator still sees `invalid-heavy` (Use Case 2's broken-config signal). The `fetch-only` slug deliberately breaks the `healthy-*` naming pattern — verb↔wire↔verdict name parity wins.
 
 `--json` emits the same verdicts under `sources[<src>].verdicts: [...]` and `sources[<src>].by_app_platform[<key>].verdicts: [...]`. Pipe into `jq` for cron alerting — anything not in the healthy set is an alert:
 
 ```bash
 adingest ingest "$(date -u -v-1d +%F)" --poll --json \
-  | jq -e '[.sources[].verdicts[]] - ["healthy-fresh", "healthy-dedup"] | length > 0' \
+  | jq -e '[.sources[].verdicts[]] - ["healthy-fresh", "healthy-dedup", "fetch-only"] | length > 0' \
   > /dev/null \
   && echo "ALERT: non-healthy verdict — page oncall"
 ```
+
+> `fetch-only` is in the healthy set so the *same* recipe works whether it polls an `ingest` or a `fetch-only` job — without it, every successful fetch-only run would false-page. One channel difference: for a `fetch-only` job the verdict envelope rides **stderr** (stdout is rows-only), so feed the recipe the envelope stream — `adingest fetch-only … --json 2>&1 >/dev/null | jq -e …`.
 
 ## `adingest upgrade`
 
@@ -240,20 +331,20 @@ Atomic self-replace. The CLI asks the service which version it should be running
 
 ```bash
 $ adingest upgrade
-Resolving server at https://api.creational.ai...
-Already at 0.1.0
+Resolving server at https://api.creational.ai/adingest...
+Already at 0.2.1
 ```
 
 When a newer version is available:
 
 ```bash
 $ adingest upgrade
-Resolving server at https://api.creational.ai...
-Server recommends 0.2.0; you are at 0.1.0
+Resolving server at https://api.creational.ai/adingest...
+Server recommends 0.3.0; you are at 0.2.1
 Fetching https://raw.githubusercontent.com/creational-ai/adingest-cli/abc123.../adingest
 Verifying sha256... ok
 Replacing /home/user/.local/bin/adingest...
-Upgraded 0.1.0 -> 0.2.0
+Upgraded 0.2.1 -> 0.3.0
 ```
 
 The flow:

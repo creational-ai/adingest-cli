@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -41,7 +42,7 @@ from rich.table import Table
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -368,8 +369,8 @@ def load_config(slug: str, home: Path = ADINGEST_HOME) -> AdingestConfig:
 #
 # * ``_atomic_write_text`` — POSIX-atomic file write via tmp + fsync +
 #   ``os.replace`` + parent-dir fsync. Single source of truth for atomic
-#   writes; reused by ``state.toml`` writes here and by the migration-side
-#   ``_merge_global_config`` (Step 11).
+#   writes; reused by ``state.toml`` writes here and by the ``init``
+#   template-scaffold writes.
 # * ``_read_state_active`` / ``write_state_active`` — read/write the
 #   ``~/.adingest/state.toml`` active-project pointer. Loud-failure on
 #   malformed TOML; silent on absent file (cascade fallthrough — Step 5
@@ -771,6 +772,21 @@ class AdingestClient:
     ) -> dict[str, Any]:
         return self._request("POST", "/v1/", json=self._build_body(event_date, source, apps))
 
+    def post_fetch_only(
+        self, event_date: str, source: str, apps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """POST a ``fetch_only=true`` ingest — no ``destinations`` block, zero writes.
+
+        The body carries the same sources/creds + apps/match config as a normal
+        ingest but sets ``fetch_only: true`` and omits ``destinations`` entirely,
+        so no BQ SA key is read and no destination creds are required (the
+        zero-cred validation win). The service runs the identical adapter fetch →
+        validation → match-remap path and stops before every sink.
+        """
+        return self._request(
+            "POST", "/v1/", json=self._build_fetch_only_body(event_date, source, apps)
+        )
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/jobs/{job_id}")
 
@@ -809,30 +825,54 @@ class AdingestClient:
                 return body
             time.sleep(interval)
 
-    def _build_body(
-        self, event_date: str, source: str, apps: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    def _build_sources_block(self, source: str) -> dict[str, Any]:
+        """Assemble the ``sources`` wire block for ``source`` (creds from config).
+
+        Shared by ``_build_body`` (normal ingest) and ``_build_fetch_only_body``
+        so the source→creds mapping lives in one place; the two callers differ
+        only in whether they append a ``destinations`` block.
+        """
         if source == "stub":
-            sources_block: dict[str, Any] = {"stub_ok": {"value": "stub"}}
-        elif source == "levelplay":
-            sources_block = {"levelplay": {
+            return {"stub_ok": {"value": "stub"}}
+        if source == "levelplay":
+            return {"levelplay": {
                 "secret_key": self.config.lp_secret_key,
                 "refresh_token": self.config.lp_refresh_token,
             }}
-        else:
-            raise click.UsageError(f"Unknown source: {source!r} (expected 'levelplay' or 'stub')")
+        raise click.UsageError(f"Unknown source: {source!r} (expected 'levelplay' or 'stub')")
+
+    def _build_body(
+        self, event_date: str, source: str, apps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         sa_key: dict[str, Any] = {}
         if self.config.bq_sa_key_path and Path(self.config.bq_sa_key_path).exists():
             sa_key = json.loads(Path(self.config.bq_sa_key_path).read_text())
         return {
             "event_date": event_date,
             "apps": apps,
-            "sources": sources_block,
+            "sources": self._build_sources_block(source),
             "destinations": {"bigquery": {
                 "project_id": self.config.bq_project_id,
                 "dataset": self.config.bq_dataset,
                 "sa_key": sa_key,
             }},
+        }
+
+    def _build_fetch_only_body(
+        self, event_date: str, source: str, apps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build the fetch-only request body: ``fetch_only: true``, NO ``destinations``.
+
+        Omitting ``destinations`` is the zero-cred contract — no BQ SA key is
+        read (``_build_body`` reads it; this path never touches it). The server's
+        ``check_destinations_present`` validator accepts a missing
+        ``destinations`` iff ``fetch_only`` is true.
+        """
+        return {
+            "event_date": event_date,
+            "apps": apps,
+            "sources": self._build_sources_block(source),
+            "fetch_only": True,
         }
 
 
@@ -857,13 +897,32 @@ class VerdictClassifier:
         ("writer-orphan-heavy", "🚨"),
         ("ga4-orphan-heavy", "🚨"),
         ("silent-drop", "🚨"),
+        ("fetch-only", "✅"),  # index-stable append (core-fetch-only Step 6)
     )
     TIER_RANK: ClassVar[dict[str, int]] = {"🚨": 0, "⚠️": 1, "✅": 2}
 
     @classmethod
-    def classify(cls, source: dict[str, Any]) -> list[str]:
+    def classify(cls, source: dict[str, Any], fetch_only: bool = False) -> list[str]:
         f = int(source.get("rows_fetched", 0))
         inv = int(source.get("rows_invalid", 0))
+        if fetch_only:
+            # Mode-aware: a fetch-only job NEVER touches the writer / dedup / GA4,
+            # so only the two PRE-SINK conditions can fire — ``empty-upstream``
+            # (f==0) and ``invalid-heavy`` (inv > 5% of f). The writer/GA4/dedup
+            # triggers (``silent-drop`` chief among them) are structurally
+            # impossible here and must not be evaluated: evaluating ``silent-drop``
+            # (i < f - inv - d, with i==d==0) fires on every healthy fetch-only
+            # source — the exact false positive this branch kills. Neither
+            # pre-sink trigger firing → the healthy ``fetch-only`` verdict.
+            fo: list[int] = []
+            if f == 0:
+                fo.append(3)  # empty-upstream 🚨 (guarded on f==0; inv can't co-fire)
+            if f > 0 and inv > 0.05 * f:
+                fo.append(4)  # invalid-heavy 🚨
+            if not fo:
+                fo.append(8)  # fetch-only ✅ (healthy: rows fetched, invalid within tolerance)
+            fo.sort(key=lambda t: (cls.TIER_RANK[cls.VERDICTS[t][1]], t))
+            return [cls.VERDICTS[t][0] for t in fo]
         d = int(source.get("rows_skipped_dedup", 0))
         i = int(source.get("rows_inserted", 0))
         o = int(source.get("rows_inserted_orphan", 0))
@@ -962,6 +1021,55 @@ class TableRenderer:
             f"failed={source.get('ga4_events_failed', 0)}"
         )
 
+    def render_fetch_only(self, response: dict[str, Any]) -> None:
+        """Render a fetch-only job: per-source counters summary + a
+        per-(platform, app_id) row breakdown derived CLI-side from the rows.
+
+        Fetch-only never touches the writer or GA4, so the writer-boundary
+        columns (``skipped_dedup`` / ``inserted`` / ``orphan`` / ``%uid``) and
+        the ``GA4:`` summary line are omitted entirely rather than rendered as
+        misleading zeros. The per-app breakdown is counted from
+        ``rows_by_source`` — the job's ``by_app_platform`` counter is a
+        writer-boundary rollup and is empty on fetch-only jobs. No raw rows are
+        dumped; only the aggregated counts are shown.
+        """
+        job_id = response.get("job_id", "?")
+        status = response.get("status", "?")
+        dur = self._duration(response)
+        self.console.print(f"Job {job_id}  status={status}  {dur}".rstrip())
+        rows_by_source = response.get("rows_by_source") or {}
+        for source_name, source in response.get("sources", {}).items():
+            self._render_fetch_only_source(
+                source_name, source, rows_by_source.get(source_name) or []
+            )
+        for err in response.get("errors") or []:
+            self.console.print(f"[red]error:[/red] {err}")
+
+    def _render_fetch_only_source(
+        self, source_name: str, source: dict[str, Any], rows: list[dict[str, Any]]
+    ) -> None:
+        # Mode-aware verdict for the fetch-only human path. Step 5 chose the
+        # dedicated ``render_fetch_only`` bypass over reusing ``_render_source``,
+        # so this single call is the entire render-side thread-through for
+        # fetch-only: ``fetch_only=True`` yields the mode-aware ``fetch-only``
+        # verdict (never the spurious ``silent-drop``).
+        slugs = VerdictClassifier.classify(source, fetch_only=True)
+        self.console.print(
+            f"Source: {source_name}  "
+            f"fetched={source.get('rows_fetched', 0)}  "
+            f"invalid={source.get('rows_invalid', 0)}  "
+            f"verdict={VerdictClassifier.display(slugs)}".rstrip()
+        )
+        breakdown = Counter(
+            (str(r.get("platform", "")), str(r.get("app_id", ""))) for r in rows
+        )
+        table = Table(show_header=True, header_style="bold")
+        for col in ("platform", "app_id", "rows"):
+            table.add_column(col)
+        for (platform, app_id), count in sorted(breakdown.items()):
+            table.add_row(platform, app_id, str(count))
+        self.console.print(table)
+
     @staticmethod
     def _duration(response: dict[str, Any]) -> str:
         started, completed = response.get("started_at"), response.get("completed_at")
@@ -978,10 +1086,18 @@ class TableRenderer:
 def _merge_verdicts_into_response(response: dict[str, Any]) -> dict[str, Any]:
     """Return ``response`` with ``verdicts: [...]`` injected at every row scope."""
     out: dict[str, Any] = json.loads(json.dumps(response))  # deep copy via JSON round-trip
+    # Top-level ``fetch_only`` picks the mode-aware trigger set. This only sees
+    # the flag because ``_emit_fetch_only`` merges BEFORE popping ``fetch_only``
+    # from the envelope (the Step 4 ordering interlock); popping first would make
+    # this classifier mode-blind and resurrect ``silent-drop`` on the stderr
+    # ``2>counters.json`` channel. (fetch-only jobs carry an empty
+    # ``by_app_platform``, so the per-app loop is a no-op for them — threading the
+    # flag there is harmless and keeps the two paths symmetric.)
+    fetch_only = bool(out.get("fetch_only"))
     for source in out.get("sources", {}).values():
-        source["verdicts"] = VerdictClassifier.classify(source)
+        source["verdicts"] = VerdictClassifier.classify(source, fetch_only=fetch_only)
         for app in source.get("by_app_platform", {}).values():
-            app["verdicts"] = VerdictClassifier.classify({**source, **app})
+            app["verdicts"] = VerdictClassifier.classify({**source, **app}, fetch_only=fetch_only)
     return out
 
 
@@ -1376,6 +1492,60 @@ def _emit(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
         TableRenderer(Console(width=160)).render(response)
 
 
+def _flatten_fetch_only_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Concatenate every source's rows from ``rows_by_source`` into one array.
+
+    Reads ``rows_by_source`` DEFENSIVELY (``... or {}``): on an all-source-fail
+    ``failed`` job the fetch-only branch never ran, so the wire body carries NO
+    ``rows_by_source`` key (the server's omission serializer pops it) — the
+    flatten must emit ``[]``, never ``KeyError``. Rows self-describe via their
+    ``source`` field, so concatenating across sources is lossless.
+    """
+    rows_by_source = response.get("rows_by_source") or {}
+    flat: list[dict[str, Any]] = []
+    for rows in rows_by_source.values():
+        flat.extend(rows)
+    return flat
+
+
+def _emit_fetch_only(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
+    """Emit a terminal fetch-only job: bare rows → stdout, counters → stderr.
+
+    ``--json``: the flattened rows array (``json.dumps``) is written to STDOUT as
+    the sole rows surface; the counters envelope — the same verdict-merged JSON
+    ``ingest --json`` emits, but with ``rows_by_source`` and ``fetch_only``
+    popped — is written to STDERR. ``--json --quiet`` suppresses the stderr
+    envelope entirely (byte-clean empty stderr; the exit code is the only
+    failure signal in that mode).
+
+    Ordering interlock (guards the Step 6 mode-aware classifier):
+    ``_merge_verdicts_into_response`` runs on the FULL response FIRST — once the
+    classifier lands it reads the top-level ``fetch_only`` flag off that response
+    to pick the trigger set — and only THEN are ``fetch_only``/``rows_by_source``
+    popped from the RETURNED envelope. Popping ``fetch_only`` before the merge
+    would make the classifier mode-blind and resurrect the ``silent-drop`` false
+    positive on this exact ``2>counters.json`` channel. The ``rows_by_source``
+    pop is also load-bearing for payload size: the merge deep-copies the whole
+    response, so leaving the key in would duplicate the entire rows array inside
+    the stderr envelope.
+
+    Human (non-``--json``) mode renders the fetch-only summary: per-source
+    counters (fetched / invalid / verdict) plus a per-(platform, app_id) row
+    breakdown counted from the returned rows. Writer-boundary columns and the
+    GA4 line are omitted (fetch-only touches neither); no raw rows are dumped.
+    """
+    if as_json:
+        click.echo(json.dumps(_flatten_fetch_only_rows(response)))
+        if not quiet:
+            envelope = _merge_verdicts_into_response(response)
+            envelope.pop("rows_by_source", None)
+            envelope.pop("fetch_only", None)
+            click.echo(json.dumps(envelope), err=True)
+        return
+    if not quiet:
+        TableRenderer(Console(width=160)).render_fetch_only(response)
+
+
 def _common(f: Any) -> Any:
     """Shared option decorator for data-touching commands.
 
@@ -1425,6 +1595,54 @@ def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_fil
     if poll and resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
     _emit(resp, as_json, quiet)
+
+
+@cli.command(name="fetch-only")
+@click.argument("event_date")
+@click.option("--source", default=None, help="Source name (default: levelplay)")
+@click.option("--stub", is_flag=True, help="Alias for --source stub")
+@click.option("--apps", "apps_file", default=None, type=click.Path(exists=True),
+              help="JSON file with apps[]")
+@_common
+def fetch_only(
+    event_date: str, source: str | None, stub: bool, apps_file: str | None,
+    project: str | None, url: str | None, token: str | None,
+    as_json: bool, quiet: bool,
+) -> None:
+    """Fetch EVENT_DATE (YYYY-MM-DD) rows without writing; pipe them to stdout.
+
+    Runs the identical adapter fetch → validation → match-remap path as
+    ``ingest`` but STOPS before every sink (no BQ write, no dedup query, no GA4
+    fan-out), returning the day's canonical revenue rows. Requires only source
+    creds + a bearer — no destination credentials.
+
+    Always polls to a terminal state (no ``--poll`` flag). With ``--json``, the
+    bare rows array lands on STDOUT (pipeable into ``jq``/files) and the counters
+    envelope on STDERR; ``--json --quiet`` gives byte-clean stdout with empty
+    stderr. Without ``--json``, prints a human counters summary and no rows dump.
+
+    Exit code: 0 on ``complete`` (an empty day is ``[]`` + exit 0); non-zero on
+    ``partial`` (surviving sources' rows still emitted to stdout), ``failed``, or
+    a non-terminal poll timeout.
+    """
+    try:
+        date.fromisoformat(event_date)
+    except ValueError:
+        raise click.UsageError(
+            "fetch-only takes a single date; use `range` for spans"
+        ) from None
+    cfg = _build_config(project, url, token, apps_file)
+    client = AdingestClient(cfg)
+    resp = client.post_fetch_only(event_date, _resolve_source(source, stub), cfg.apps)
+    if resp.get("job_id"):
+        resp = client.poll_until_terminal(resp["job_id"])
+    _emit_fetch_only(resp, as_json, quiet)
+    # Strict exit: only a terminal ``complete`` is success. ``partial`` /
+    # ``failed`` / a non-terminal poll-timeout body all exit non-zero — the
+    # rows (or ``[]``) have already been emitted above, so a partial run still
+    # pipes its surviving rows before the alarm fires.
+    if resp.get("status") != "complete":
+        sys.exit(1)
 
 
 @cli.command(name="range")
@@ -1658,12 +1876,11 @@ def current() -> None:
 # strings for structural fields the operator must fill) + an empty,
 # mode-0600 ``.env`` scaffold + auto-activate if no current active.
 #
-# Two branches:
+# ``init <slug>`` scaffolds a template caller dir (the legacy
+# ``--from-env-client`` migration branch was retired with ``.env.client`` on
+# 2026-06-22).
 #
-#   * Bare ``init <slug>``                — template branch (this step)
-#   * ``init <slug> --from-env-client X`` — migration branch (wired in Step 12)
-#
-# Auto-activate (per E2 H1): after the if/else, if ``state.toml`` has no
+# Auto-activate (per E2 H1): if ``state.toml`` has no
 # active slug (``_read_state_active`` returns None), this step's ``init``
 # writes ``state.toml`` so the just-created slug becomes the active one.
 # Subsequent ``init`` calls (when an active is already set) do NOT change
@@ -1684,8 +1901,8 @@ def _write_template_config(target_dir: Path, slug: str) -> None:
     Materializes the per-caller scaffolding for ``adingest init <slug>``'s
     bare-template branch. The ``config.toml`` carries the three structural
     sections (``[ingest_api]``, ``[levelplay]``, ``[bq]``) with ``${VAR}``
-    placeholders for the secret fields (per Step 11's ``_SECRET_TO_TOML``
-    map: ``LP_SECRET_KEY``, ``LP_REFRESH_TOKEN``); structural fields
+    placeholders for the secret fields (``LP_SECRET_KEY``,
+    ``LP_REFRESH_TOKEN``); structural fields
     (``url``, ``project_id``, ``dataset``, ``sa_key_path``) are blank
     strings the operator fills via editor. A commented stub at the end of
     the file directs the operator at the goal-doc's "What the operator
@@ -1764,331 +1981,9 @@ def _write_template_config(target_dir: Path, slug: str) -> None:
     os.chmod(env_path, 0o600)
 
 
-# --- Migration helpers: `.env.client` → per-caller TOML + .env -------------
-#
-# Step 11 of core-cli-config-refactor. Translates a legacy ``.env.client``
-# (the pre-refactor cwd-coupled env-file) into the new ``~/.adingest/<slug>/``
-# layout:
-#
-#   * Structural KEY=value lines → per-caller ``config.toml`` (literal value
-#     under the mapped ``[section].key``)
-#   * Secret KEY=value lines     → per-caller ``.env`` (literal value);
-#                                   ``${KEY}`` REFERENCE in per-caller TOML
-#   * ``INGEST_API_URL``         → GLOBAL ``~/.adingest/config.toml`` as
-#                                   LITERAL under ``[ingest_api].url``
-#   * ``INGEST_API_TOKEN``       → per-caller ``.env`` as LITERAL +
-#                                   global ``[ingest_api].token = "${INGEST_API_TOKEN}"``
-#                                   REFERENCE (token literal NEVER lands in
-#                                   any ``config.toml``)
-#   * ``APPS_JSON``              → per-caller TOML's ``[[apps]]`` table-array
-#                                   with nested ``[apps.ga4]`` preserved per
-#                                   D14; literal ``ga4.api_secret`` extracted
-#                                   into ``.env`` as ``GA4_API_SECRET``
-#   * ``LP_TEST_*``              → SKIPPED with stderr note (test-scope
-#                                   segregation per D16 / Goal 4 — writing
-#                                   test creds to a prod caller's ``.env``
-#                                   would re-introduce the namespace
-#                                   pollution the refactor exists to fix)
-#   * Unrecognized               → stderr warning, line skipped
-#
-# Pre-flight required-key checks: ``INGEST_API_URL`` AND ``INGEST_API_TOKEN``
-# MUST be present in the input ``.env.client`` BEFORE any file writes happen.
-# A missing required key fails LOUDLY before the migration mutates the
-# filesystem — guarantees ``~/.adingest/<slug>/`` is never left
-# half-initialized (which would require ``rm -rf`` to recover).
-#
-# Global TOML side: every routing decision that touches the global file
-# accumulates into an in-memory ``global_doc`` dict; a SINGLE end-of-loop
-# ``_merge_global_config`` call does the only global-side write. Avoids the
-# per-key-call footgun where ``_merge_global_config`` would re-read +
-# re-write on each key.
-
-
-#: Structural env-vars → ``(TOML section, key)`` mapping. Values land LITERAL
-#: in per-caller ``config.toml``. The legacy ``BQ_TEST_*`` shell-side names
-#: rename to ``BQ_*`` in the migrated TOML per D11 (cutover-time rename); the
-#: shell env-var names themselves remain ``BQ_TEST_*`` per D16 for the test
-#: namespace's continuity. ``INGEST_API_URL`` is special-cased in
-#: ``_migrate_from_env_client`` (routes to GLOBAL TOML, not per-caller) and
-#: therefore is NOT included in this map.
-_ENV_VAR_TO_TOML: dict[str, tuple[str, str]] = {
-    "BQ_TEST_PROJECT_ID":  ("bq", "project_id"),
-    "BQ_TEST_DATASET":     ("bq", "dataset"),
-    "BQ_TEST_SA_KEY_PATH": ("bq", "sa_key_path"),
-}
-
-#: Secret env-vars that get a ``${VAR}`` REFERENCE written into per-caller
-#: ``config.toml`` (the literal value lands in per-caller ``.env``). Note:
-#: ``INGEST_API_TOKEN`` is NOT here — it has its own routing branch (per-caller
-#: ``.env`` literal + global TOML ``${INGEST_API_TOKEN}`` reference, NOT
-#: per-caller TOML reference); ``GA4_API_SECRET`` is NOT here either — its
-#: reference lives PER-APP at ``apps[*].ga4.api_secret`` and is handled inside
-#: the ``APPS_JSON`` branch of the migration loop.
-_SECRET_TO_TOML: dict[str, tuple[str, str]] = {
-    "LP_SECRET_KEY":    ("levelplay", "secret_key"),
-    "LP_REFRESH_TOKEN": ("levelplay", "refresh_token"),
-}
-
-#: Non-token per-caller secrets that land LITERAL in per-caller ``.env``.
-#: ``INGEST_API_TOKEN`` is handled by its own routing branch (the token literal
-#: still lands in per-caller ``.env``, but the routing also writes a global TOML
-#: reference — separate concerns). ``GA4_API_SECRET`` lands in ``.env`` via the
-#: ``APPS_JSON`` branch (literal ``ga4.api_secret`` value is extracted from the
-#: parsed apps list).
-_SECRET_ENV_VARS: set[str] = {"LP_SECRET_KEY", "LP_REFRESH_TOKEN", "GA4_API_SECRET"}
-
-
-def _parse_env_file(path: Path) -> dict[str, str]:
-    """Parse a KEY=value env file into a ``dict[str, str]``.
-
-    Same line-loop semantics as :func:`_source_project_env` (the runtime
-    secrets loader for ``~/.adingest/<slug>/.env``): ``KEY=value`` lines,
-    ``#`` comments, blank lines skipped, surrounding single/double quotes
-    stripped from the value, malformed lines (no ``=``) silently skipped.
-
-    The migration branch consumes this to read the legacy ``.env.client`` into
-    a flat dict; :func:`_migrate_from_env_client` then routes each key
-    according to ``_ENV_VAR_TO_TOML`` / ``_SECRET_TO_TOML`` / the special-case
-    branches.
-
-    Args:
-        path: Path to the env file. Caller is responsible for existence
-            (Click's ``type=click.Path(exists=True)`` on ``init``'s flag
-            handles this in production; tests use real fixture files).
-
-    Returns:
-        Flat dict mapping the parsed KEY to its stripped value.
-    """
-    out: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        out[key.strip()] = value.strip().strip('"').strip("'")
-    return out
-
-
-def _merge_global_config(home: Path, ingest_api_dict: dict[str, str]) -> None:
-    """Merge ``[ingest_api]`` values into the global ``~/.adingest/config.toml``.
-
-    Reads the existing global config (or starts from empty when absent),
-    deep-merges the caller-supplied ``ingest_api_dict`` under the
-    ``[ingest_api]`` section, and atomic-writes the result via the shared
-    :func:`_atomic_write_text` helper (Step 4 durability parity).
-
-    Asymmetry contract (caller-side): ``url`` is passed as a LITERAL value
-    (e.g., ``"https://api.creational.ai"``) because URLs are not secrets;
-    ``token`` is passed as the verbatim string ``"${INGEST_API_TOKEN}"`` — the
-    REFERENCE, not the literal token. The global TOML never carries the token
-    literal; the literal lives only in per-caller ``.env``. This matches the
-    goal-doc's secret-separation contract (lines 162 + 200).
-
-    Args:
-        home: ``ADINGEST_HOME`` (or a test ``tmp_path``). The function does
-            NOT create ``home`` — caller is expected to have invoked
-            ``home.mkdir(parents=True, exist_ok=True)`` already (e.g., via
-            ``write_state_active`` or ``init``'s ``target_dir.mkdir``).
-        ingest_api_dict: Mapping with ``"url"`` and/or ``"token"`` keys.
-            Both optional; only the present keys are merged.
-    """
-    global_path = home / "config.toml"
-    existing = _read_toml_if_exists(global_path)
-    merged = _deep_merge(existing, {"ingest_api": ingest_api_dict})
-    _atomic_write_text(global_path, tomli_w.dumps(merged), home)
-
-
-def _migrate_from_env_client(
-    env_client_path: Path,
-    target_dir: Path,
-    home: Path = ADINGEST_HOME,
-) -> None:
-    """Translate a legacy ``.env.client`` into the new ``~/.adingest/<slug>/`` layout.
-
-    Routes each parsed KEY=value pair according to the classification maps
-    (``_ENV_VAR_TO_TOML`` / ``_SECRET_TO_TOML`` / ``_SECRET_ENV_VARS``) plus the
-    four special-case branches (``INGEST_API_URL``, ``INGEST_API_TOKEN``,
-    ``APPS_JSON``, ``LP_TEST_*``). Writes three artifacts:
-
-    1. Per-caller ``config.toml`` — structural values + ``${VAR}`` references
-       for secrets (atomic write via :func:`_atomic_write_text`)
-    2. Per-caller ``.env`` — secret literals (mode 0600 via ``os.chmod`` after
-       the atomic write)
-    3. Global ``~/.adingest/config.toml`` — ``[ingest_api].url`` literal +
-       ``[ingest_api].token`` reference (single end-of-loop merge via
-       :func:`_merge_global_config`)
-
-    Pre-flight required-key checks run BEFORE any file writes — a missing
-    ``INGEST_API_URL`` or ``INGEST_API_TOKEN`` fails LOUDLY before the
-    migration mutates the filesystem. This guarantees ``target_dir`` is never
-    left half-initialized (which would require ``rm -rf ~/.adingest/<slug>/``
-    to recover).
-
-    ``APPS_JSON`` shape preservation per D14: nested ``[apps.ga4]`` sub-dicts
-    are preserved as-is; literal ``ga4.api_secret`` values are extracted into
-    the ``.env`` bucket as ``GA4_API_SECRET`` and replaced in the parsed app
-    dict with the string ``"${GA4_API_SECRET}"``. XOR validator-respect:
-    whichever of ``measurement_id`` / ``firebase_app_id`` the input populates
-    is copied through; the missing one is NOT synthesized.
-
-    ``LP_TEST_*`` lines are SKIPPED (not written to the migrated slug's
-    ``.env``) — writing them would re-introduce the prod/test namespace
-    pollution Goal 4 set out to fix (per D16). A stderr note directs the
-    operator at ``init test`` or manual edit of ``~/.adingest/test/.env``.
-
-    Args:
-        env_client_path: Path to the legacy ``.env.client``. Caller (the
-            ``init`` command body in Step 12, or a test) is responsible for
-            existence (Click's ``type=click.Path(exists=True)`` handles it
-            in production).
-        target_dir: Per-caller dir (``~/.adingest/<slug>/``). Caller creates
-            this before invoking; the function writes ``config.toml`` +
-            ``.env`` into it.
-        home: Global config home. The global ``config.toml`` is written
-            (or merged into) at ``home / "config.toml"``. Defaults to
-            ``ADINGEST_HOME`` module constant; tests inject a ``tmp_path``.
-
-    Raises:
-        click.ClickException: When ``INGEST_API_URL`` or ``INGEST_API_TOKEN``
-            is missing from the input ``.env.client``. Pre-flight check; no
-            partial-state corruption.
-    """
-    parsed = _parse_env_file(env_client_path)
-
-    # Pre-flight required-key checks BEFORE any file writes. If either is
-    # absent, raise loudly — partial migration would leave the operator
-    # with a broken ``~/.adingest/<slug>/`` that requires manual cleanup.
-    if "INGEST_API_URL" not in parsed:
-        raise click.ClickException(
-            "INGEST_API_URL required in .env.client for migration; "
-            "the global ~/.adingest/config.toml needs a base URL"
-        )
-    if "INGEST_API_TOKEN" not in parsed:
-        raise click.ClickException(
-            "INGEST_API_TOKEN required in .env.client for migration; "
-            "per-caller .env would be missing the service bearer token, "
-            "causing next CLI fire to 401"
-        )
-
-    # In-memory accumulators. Single end-of-loop write to each destination —
-    # no per-key fsync churn, no half-state-on-crash risk between branches.
-    toml_doc: dict[str, Any] = {}
-    secrets: dict[str, str] = {}
-    global_doc: dict[str, Any] = {}
-
-    for key, value in parsed.items():
-        if key == "APPS_JSON":
-            # Parse the JSON array; preserve nested ``ga4`` sub-dict shape
-            # per D14. For any literal ``ga4.api_secret`` (i.e., not already
-            # a ``${...}`` reference), extract the literal to ``.env`` as
-            # ``GA4_API_SECRET`` and replace with the reference string.
-            apps_raw = json.loads(value)
-            apps_out: list[dict[str, Any]] = []
-            for app in apps_raw:
-                # Shallow-copy the app so we don't mutate the parsed-JSON
-                # structure (defensive; the JSON parser already returns a
-                # fresh object, but explicit-copy keeps the intent clear).
-                app_out: dict[str, Any] = dict(app)
-                ga4 = app_out.get("ga4")
-                if isinstance(ga4, dict):
-                    ga4_out = dict(ga4)
-                    api_secret = ga4_out.get("api_secret")
-                    # Extract only LITERAL secrets — if the value is already
-                    # ``${VAR}``, leave it alone (idempotent re-migration).
-                    if (
-                        isinstance(api_secret, str)
-                        and not api_secret.startswith("${")
-                    ):
-                        secrets["GA4_API_SECRET"] = api_secret
-                        ga4_out["api_secret"] = "${GA4_API_SECRET}"
-                    app_out["ga4"] = ga4_out
-                apps_out.append(app_out)
-            toml_doc["apps"] = apps_out
-
-        elif key == "INGEST_API_URL":
-            # LITERAL value goes to GLOBAL TOML — URL is not a secret.
-            # Accumulator-only; final merge happens at end of loop.
-            global_doc.setdefault("ingest_api", {})["url"] = value
-
-        elif key == "INGEST_API_TOKEN":
-            # LITERAL value to per-caller ``.env`` (it IS a secret) AND a
-            # ``${INGEST_API_TOKEN}`` REFERENCE to GLOBAL TOML. The token
-            # literal NEVER lands in any ``config.toml`` (secret separation
-            # per goal-doc lines 162 + 200).
-            secrets["INGEST_API_TOKEN"] = value
-            global_doc.setdefault("ingest_api", {})["token"] = "${INGEST_API_TOKEN}"
-
-        elif key in _ENV_VAR_TO_TOML:
-            # Structural value → per-caller TOML literal under mapped section.
-            section, toml_key = _ENV_VAR_TO_TOML[key]
-            toml_doc.setdefault(section, {})[toml_key] = value
-
-        elif key in _SECRET_TO_TOML:
-            # Secret value → per-caller ``.env`` literal + per-caller TOML
-            # ``${KEY}`` REFERENCE.
-            section, toml_key = _SECRET_TO_TOML[key]
-            secrets[key] = value
-            toml_doc.setdefault(section, {})[toml_key] = f"${{{key}}}"
-
-        elif key in _SECRET_ENV_VARS:
-            # Non-token per-caller secrets that aren't TOML-referenced from a
-            # mapped section (currently empty after subtracting the
-            # ``_SECRET_TO_TOML`` keys above — kept as a defensive branch
-            # for forward-compat with future secret-only vars).
-            secrets[key] = value
-
-        elif key.startswith("LP_TEST_"):
-            # Test-scope segregation per D16 / Goal 4. Operator gets a clear
-            # stderr note rather than silent data-loss.
-            click.echo(
-                f"note: {key} belongs to test caller scope; "
-                f"populate ~/.adingest/test/.env separately via "
-                f"`adingest init test` or manual edit",
-                err=True,
-            )
-
-        else:
-            # Unrecognized var — stderr warning, line skipped. Loud enough
-            # to surface in CliRunner output, soft enough to not block the
-            # migration on forward-compat vars the operator may have added.
-            click.echo(
-                f"warning: unrecognized var {key}; skipped",
-                err=True,
-            )
-
-    # Per-caller ``config.toml`` — atomic write via Step 4 helper.
-    _atomic_write_text(
-        target_dir / "config.toml", tomli_w.dumps(toml_doc), target_dir,
-    )
-
-    # Per-caller ``.env`` — atomic write + chmod 0600. The ``.env`` format
-    # mirrors the operator-facing convention (``KEY=value`` lines, one per
-    # line, no comments / quotes — operators can edit directly). Sorting the
-    # keys keeps the output deterministic for test assertions.
-    env_lines = [f"{k}={v}\n" for k, v in sorted(secrets.items())]
-    env_payload = "".join(env_lines)
-    env_path = target_dir / ".env"
-    _atomic_write_text(env_path, env_payload, target_dir)
-    os.chmod(env_path, 0o600)
-
-    # Global ``config.toml`` — single merge call at end of loop. ``home`` is
-    # the parent of ``target_dir``; we let ``_merge_global_config`` handle
-    # the read-merge-write sequence so the existing global content (set up
-    # by an earlier ``init <other-slug>``) is preserved.
-    if global_doc:
-        home.mkdir(parents=True, exist_ok=True)
-        _merge_global_config(home, global_doc.get("ingest_api", {}))
-
-
 @cli.command()
 @click.argument("slug")
-@click.option(
-    "--from-env-client",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Migrate from a legacy .env.client file into the new ~/.adingest/<slug>/ layout.",
-)
-def init(slug: str, from_env_client: str | None) -> None:
+def init(slug: str) -> None:
     """Bootstrap ``~/.adingest/<slug>/`` with a template config + empty .env.
 
     Creates the per-caller directory and writes a template ``config.toml``
@@ -2104,15 +1999,9 @@ def init(slug: str, from_env_client: str | None) -> None:
     Refuses to overwrite an existing ``~/.adingest/<slug>/`` directory;
     the operator must remove it manually if re-init is intended.
 
-    The ``--from-env-client <path>`` flag (Step 12) migrates a legacy
-    ``.env.client`` into the new layout via :func:`_migrate_from_env_client`
-    — translates the parsed ``KEY=value`` pairs into per-caller
-    ``config.toml`` + per-caller ``.env`` (mode 0600) + global
-    ``~/.adingest/config.toml``. Pre-flight required-key checks
-    (``INGEST_API_URL`` / ``INGEST_API_TOKEN``) fail BEFORE any file
-    writes so a missing-input migration never leaves the target dir
-    half-initialized. When the flag is omitted, the template branch
-    runs (``${VAR}`` placeholders for secrets; blank structural fields).
+    (The legacy ``--from-env-client`` migration flag was retired with
+    ``.env.client`` on 2026-06-22 — populate the scaffolded ``config.toml`` +
+    ``.env`` directly.)
     """
     _validate_slug(slug)
 
@@ -2130,18 +2019,7 @@ def init(slug: str, from_env_client: str | None) -> None:
 
     target_dir.mkdir(parents=True)
 
-    if from_env_client is not None:
-        # Step 12 — replace Step 7's ``ClickException`` placeholder with the
-        # real migration helper landed in Step 11. ``_migrate_from_env_client``
-        # runs its own pre-flight checks (``INGEST_API_URL`` /
-        # ``INGEST_API_TOKEN``) BEFORE any file writes, so a missing-input
-        # migration leaves the just-created ``target_dir`` empty (recoverable
-        # by ``rmdir`` since no files materialized; Click's exit-via-raise
-        # surfaces the loud-fail message to the operator).
-        _migrate_from_env_client(Path(from_env_client), target_dir, home=home)
-        click.echo(f"Initialized {slug} from {from_env_client}")
-    else:
-        _write_template_config(target_dir, slug)
+    _write_template_config(target_dir, slug)
 
     # Auto-activate (per E2 H1): only when no current active. ``init``
     # bootstrapping the very first caller should leave the operator with
