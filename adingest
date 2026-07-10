@@ -42,7 +42,7 @@ from rich.table import Table
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.2"
+__version__ = "0.2.4"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -956,6 +956,40 @@ class VerdictClassifier:
         return f"{emoji} {slugs[0]}"
 
 
+def _per_app_counters(source: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    """Build a SCOPE-CORRECT per-(platform, app_id) counter dict for classification.
+
+    The engine's ``by_app_platform`` rollup carries only writer-boundary counters
+    (``rows_skipped_dedup`` / ``rows_inserted`` / ``rows_inserted_orphan``) — there is
+    NO per-app ``rows_fetched`` or ``rows_invalid`` because unmatched rows (counted in
+    the source's ``rows_invalid``) belong to NO app. Naively classifying
+    ``{**source, **app}`` lets each app inherit the SOURCE's total ``rows_fetched`` /
+    ``rows_invalid`` / GA4 counters while carrying only its own writer slice, so
+    ``silent-drop`` (``i < f - inv - d``) fires falsely on every app of a multi-app
+    source — the source total is charged against one app's rows. (Single-app sources
+    masked this: source-fetched == that app's fetched.)
+
+    Scope-correct model: per-app ``rows_fetched`` is the rows that MATCHED this app =
+    ``rows_inserted + rows_skipped_dedup`` (orphan is a subset of inserted, not
+    additive); per-app ``rows_invalid`` and GA4 counters are 0 (source-level concepts
+    with no per-app breakdown). This makes every per-app verdict meaningful
+    (healthy-fresh / healthy-dedup / partial-dedup / writer-orphan-heavy) and makes
+    ``silent-drop`` structurally impossible at app scope (``i < (i+d) - 0 - d`` == ``i < i``).
+    """
+    d = int(app.get("rows_skipped_dedup", 0))
+    i = int(app.get("rows_inserted", 0))
+    o = int(app.get("rows_inserted_orphan", 0))
+    return {
+        "rows_fetched": i + d,  # matched rows for this app (unmatched rows have no app)
+        "rows_invalid": 0,
+        "rows_skipped_dedup": d,
+        "rows_inserted": i,
+        "rows_inserted_orphan": o,
+        "ga4_events_attempted": 0,  # no per-app GA4 breakdown — source-scope only
+        "ga4_events_skipped_orphan": 0,
+    }
+
+
 # --- Renderer ---------------------------------------------------------------
 
 
@@ -997,7 +1031,7 @@ class TableRenderer:
             for key, app in by_app.items():
                 ins = int(app.get("rows_inserted", 0))
                 orp = int(app.get("rows_inserted_orphan", 0))
-                slugs = VerdictClassifier.classify({**source, **app})
+                slugs = VerdictClassifier.classify(_per_app_counters(source, app))
                 table.add_row(key, "⋯", "⋯", "⋯", str(ins), str(orp),
                               _format_uid_pct(ins, orp), VerdictClassifier.display(slugs))
             table.add_section()
@@ -1097,7 +1131,9 @@ def _merge_verdicts_into_response(response: dict[str, Any]) -> dict[str, Any]:
     for source in out.get("sources", {}).values():
         source["verdicts"] = VerdictClassifier.classify(source, fetch_only=fetch_only)
         for app in source.get("by_app_platform", {}).values():
-            app["verdicts"] = VerdictClassifier.classify({**source, **app}, fetch_only=fetch_only)
+            app["verdicts"] = VerdictClassifier.classify(
+                _per_app_counters(source, app), fetch_only=fetch_only
+            )
     return out
 
 
