@@ -39,7 +39,7 @@ adingest --version
 ```
 
 ```
-adingest, version 0.2.1
+adingest, version 0.2.2
 ```
 
 Point it at a service — `adingest init <slug>` bootstraps `~/.adingest/<slug>/config.toml` + `.env` with template placeholders; edit those two files (see [Configuration](#configuration) below for the layout):
@@ -126,7 +126,7 @@ $ adingest --project hexario ingest 2026-05-27 & \
 
 Use the always-explicit `--project <slug>` form for cron / scripted invocations so interactive `use` of another slug never redirects them.
 
-Every subcommand accepts `--url`, `--token`, and `--project <slug>` (overrides cascade). `ingest` / `range` additionally accept `--apps FILE` (a JSON file path that overrides the per-project TOML `[[apps]]` list).
+Every subcommand accepts `--url`, `--token`, and `--project <slug>` (overrides cascade). `ingest` / `range` / `fetch-only` additionally accept `--apps FILE` (a JSON file path that overrides the per-project TOML `[[apps]]` list).
 
 > Credentials live in the service's request body for one call and are dropped after the response. The service is stateless — nothing about your account is persisted on it.
 
@@ -332,7 +332,7 @@ Atomic self-replace. The CLI asks the service which version it should be running
 ```bash
 $ adingest upgrade
 Resolving server at https://api.creational.ai/adingest...
-Already at 0.2.1
+Already at 0.2.2
 ```
 
 When a newer version is available:
@@ -340,11 +340,11 @@ When a newer version is available:
 ```bash
 $ adingest upgrade
 Resolving server at https://api.creational.ai/adingest...
-Server recommends 0.3.0; you are at 0.2.1
+Server recommends 0.3.0; you are at 0.2.2
 Fetching https://raw.githubusercontent.com/creational-ai/adingest-cli/abc123.../adingest
 Verifying sha256... ok
 Replacing /home/user/.local/bin/adingest...
-Upgraded 0.2.1 -> 0.3.0
+Upgraded 0.2.2 -> 0.3.0
 ```
 
 The flow:
