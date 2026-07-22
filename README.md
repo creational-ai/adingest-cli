@@ -130,6 +130,33 @@ Every subcommand accepts `--url`, `--token`, and `--project <slug>` (overrides c
 
 > Credentials live in the service's request body for one call and are dropped after the response. The service is stateless — nothing about your account is persisted on it.
 
+### Excluding test devices
+
+Test phones generate real ad impressions that pollute production revenue — a QA device's Meta/banner traffic can dominate a small app's daily total. Declare those devices once and the service drops their REVENUE rows **at the engine seam, before any write**: nothing lands in BigQuery and nothing fans out to GA4. The drop is counted per source as `rows_skipped_test_device` (surfaced as a `skipped_test` column in the table and on the `--json` wire), so an exclusion is always observable, never silent.
+
+Add an `[[exclusions.test_devices]]` array to a `config.toml`. The global file (`~/.adingest/config.toml`) is the recommended home so every project inherits one roster:
+
+```toml
+[[exclusions.test_devices]]
+name = "Dominic Galaxy S23"            # required — an operator label; shown in the summary, never sent to the service
+id   = "495d5f3e-0000-4a1b-9c2d-1234"  # the device's advertising ID (idfa on iOS, idfv / GAID on Android)
+
+[[exclusions.test_devices]]
+name = "QA iPhone 14"
+id   = "8f14e45f-ceea-467a-9f1b-5678"
+```
+
+- **What crosses the wire.** Only `id` is sent — flattened onto the `test_device_ids` wire field. `name` stays caller-side and is used solely for the by-name roster the CLI prints when rows are dropped. A raw advertising ID never appears in any rendered output (counts and operator-authored names only).
+- **Matching is case-insensitive and whitespace-trimmed.** Each configured `id` and each row's `idfa` / `idfv` is normalized (`.strip().lower()`) before comparison, so a mixed-case or space-padded ID still matches. A row carrying no `idfa` / `idfv` is simply never a match.
+- **The all-zeros ID is rejected.** `00000000-0000-0000-0000-000000000000` is the platform opt-out sentinel — the ID reported for a user who disabled ad tracking (**Android 12+ / iOS 14.5+** behavior; it is *not* a universal "null device" across all platforms). Configuring it returns `422 test-device-id-invalid` rather than silently excluding every opted-out user.
+- **Per-slug overrides — it does not extend.** A per-project `[[exclusions.test_devices]]` block **replaces** the global roster wholesale for that slug (config arrays merge by replacement, never union). If a slug's `skipped_test` unexpectedly drops to 0, check whether a per-slug `[exclusions]` block silently shadowed the global list.
+
+**Three things this is deliberately not:**
+
+- **Forward-only.** The filter drops rows on ingest from now on; it does **not** clean rows already written to BigQuery or already sent to GA4. Purge that history separately.
+- **Not a GA4 / BQ history cleaner.** Same point from the destination side — already-landed test revenue stays until you delete it out-of-band.
+- **Perishable IDs, so watch the counter.** Advertising IDs rotate (a factory reset, an OS-level advertising-ID reset, an app reinstall). A stale ID silently stops matching and that device's traffic quietly rejoins production. `skipped_test` reading 0 — or the by-name roster disappearing on a day you know a test device was active — is the signal to refresh the IDs. The feature fails open by design.
+
 ## `adingest ingest`
 
 POST one ingest for a single `EVENT_DATE` (ISO date, `YYYY-MM-DD`). Returns immediately with a `job_id`; pass `--poll` to wait until terminal and render the table.
@@ -249,7 +276,7 @@ Without `--json`, human mode prints a per-source counters summary plus a rows-pe
 
 ```
 Job ing_01KS7…  status=complete  1.9s
-Source: levelplay  fetched=1240  invalid=0  verdict=✅ fetch-only
+Source: levelplay  fetched=1240  invalid=0  skipped_test=0  verdict=✅ fetch-only
 ┏━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┓
 ┃ platform ┃ app_id                       ┃ rows ┃
 ┡━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━┩
@@ -307,7 +334,7 @@ Each source gets exactly one verdict per job, plus per-`(platform, app_id)` verd
 | 🚨 | `invalid-heavy` | `rows_invalid` is a significant fraction of `rows_fetched` (adapter-drop heavy) |
 | 🚨 | `writer-orphan-heavy` | `rows_inserted_orphan` is a significant fraction of `rows_inserted` (BQ landed but no `user_id`) |
 | 🚨 | `ga4-orphan-heavy` | `ga4_events_skipped_orphan` is a significant fraction of `ga4_events_attempted` |
-| 🚨 | `silent-drop` | Counter-balance violation — `rows_fetched != rows_invalid + rows_skipped_dedup + rows_inserted`. Means a row vanished between fetch and BQ without classification. |
+| 🚨 | `silent-drop` | Counter-balance violation — `rows_fetched != rows_invalid + rows_skipped_test_device + rows_skipped_dedup + rows_inserted`. Means a row vanished between fetch and BQ without classification. |
 | ✅ | `fetch-only` | A `fetch-only` job that fired neither `empty-upstream` nor `invalid-heavy` — the healthy fetch-only outcome: rows fetched and valid, nothing written by design. |
 
 > The tier emoji (`✅` / `⚠️` / `🚨`) is render-only — it shows in the table output. The JSON `verdicts` field carries just the bare name (e.g. `["healthy-fresh"]`).

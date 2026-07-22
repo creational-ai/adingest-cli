@@ -42,7 +42,7 @@ from rich.table import Table
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -54,13 +54,33 @@ PRODUCT = "adingest"
 
 
 @dataclass(frozen=True)
+class TestDevice:
+    """A caller-declared test device whose REVENUE rows are excluded server-side.
+
+    Two fields: an operator-authored ``name`` (a human label — safe to render
+    in logs/summaries) and the advertising ``id`` (idfa/idfv) matched against
+    each revenue row. Only ``id`` is flattened onto the wire
+    (``test_device_ids``); ``name`` stays caller-side and is used solely for the
+    named roster the CLI renders when rows are dropped (counts only, never IDs).
+
+    Frozen so a parsed roster is immutable once loaded. ``name`` may be ``""``
+    for an entry that omitted its label (``_parse_test_devices`` warns rather
+    than fails) — matching is keyed on ``id``, so a nameless entry still filters;
+    the roster renders it as an unlabeled device rather than degrading silently.
+    """
+    name: str
+    id: str
+
+
+@dataclass(frozen=True)
 class AdingestConfig:
     """Caller-side configuration; frozen so flag overrides go through ``replace``.
 
     Step 9 of core-cli-config-refactor: the legacy ``from_env`` classmethod and
     the cwd-coupled ``_load_env_client`` loader were removed in favor of the
     TOML-backed ``load_config(slug)`` pipeline (Step 3). The dataclass shape is
-    unchanged — same eight fields, same defaults, still frozen — but the
+    unchanged — same nine fields (``test_devices`` added by
+    core-test-device-exclusion), same defaults, still frozen — but the
     construction surface is now the loader, not env-var scraping.
     """
     url: str = "http://localhost:8000"
@@ -71,6 +91,7 @@ class AdingestConfig:
     bq_project_id: str = ""
     bq_dataset: str = ""
     bq_sa_key_path: str = ""
+    test_devices: list[TestDevice] = field(default_factory=list)
 
 
 # --- TOML config loader (~/.adingest/<slug>/) ------------------------------
@@ -203,6 +224,63 @@ def _interpolate_env_recursive(value: Any) -> Any:
     return value
 
 
+def _parse_test_devices(raw: list[dict[str, Any]]) -> list[TestDevice]:
+    """Translate ``[[exclusions.test_devices]]`` entries to ``TestDevice`` records.
+
+    Each entry is a TOML table with a required ``id`` (the advertising
+    identifier — idfa/idfv — matched server-side against revenue rows) and a
+    recommended ``name`` (an operator-authored human label).
+
+    Contract:
+
+    * Missing ``id`` is a HARD ERROR — ``click.ClickException`` naming the
+      offending entry. An entry that can't be matched on is a config mistake
+      the operator must fix, not silently drop (a silently-dropped device
+      would keep polluting BQ with the operator none the wiser).
+    * Missing ``name`` is a SOFT WARNING (stderr) — the entry is kept with
+      ``name=""``. Matching keys on ``id``, so a nameless entry still filters;
+      the roster later renders it as an unlabeled device rather than failing
+      the whole run over a cosmetic omission.
+
+    This helper carries the only raise in the config-translation path so
+    ``_to_adingest_config`` stays "structural only" — the fail-loud validation
+    is isolated here.
+
+    Args:
+        raw: The ``exclusions.test_devices`` array from the merged TOML dict
+            (each element a dict as produced by ``tomllib``). Empty/absent →
+            empty list (no exclusions configured).
+
+    Returns:
+        A list of frozen ``TestDevice`` records, order-preserving.
+
+    Raises:
+        click.ClickException: an entry omits ``id`` (message names the entry).
+
+    Examples::
+
+        >>> _parse_test_devices([{"name": "Galaxy", "id": "495d..."}])
+        [TestDevice(name='Galaxy', id='495d...')]
+    """
+    devices: list[TestDevice] = []
+    for entry in raw:
+        device_id = entry.get("id")
+        if not device_id:
+            raise click.ClickException(
+                f"test_devices entry missing required 'id': {entry!r}"
+            )
+        name = entry.get("name")
+        if not name:
+            click.echo(
+                f"warning: test_devices entry {device_id!r} has no 'name'; "
+                "it will filter but render unlabeled in the roster",
+                err=True,
+            )
+            name = ""
+        devices.append(TestDevice(name=str(name), id=str(device_id)))
+    return devices
+
+
 def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
     """Translate a merged-and-interpolated TOML dict to a frozen ``AdingestConfig``.
 
@@ -224,6 +302,7 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
         [bq].dataset                      bq_dataset
         [bq].sa_key_path                  bq_sa_key_path  (expanduser applied)
         [[apps]]                          apps            (list pass-through)
+        [[exclusions.test_devices]]       test_devices    (parsed → TestDevice)
 
     Path-typed fields: only ``bq_sa_key_path`` today. ``${VAR}`` interpolation
     happens BEFORE this step; ``~``-expansion happens AFTER, so a
@@ -263,6 +342,8 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
     levelplay = merged.get("levelplay") or {}
     bq = merged.get("bq") or {}
     apps = merged.get("apps") or []
+    exclusions = merged.get("exclusions") or {}
+    test_devices = _parse_test_devices(exclusions.get("test_devices") or [])
 
     bq_sa_key_path_raw = bq.get("sa_key_path", "")
     bq_sa_key_path = (
@@ -278,6 +359,7 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
         bq_project_id=bq.get("project_id", ""),
         bq_dataset=bq.get("dataset", ""),
         bq_sa_key_path=bq_sa_key_path,
+        test_devices=test_devices,
     )
 
 
@@ -847,7 +929,7 @@ class AdingestClient:
         sa_key: dict[str, Any] = {}
         if self.config.bq_sa_key_path and Path(self.config.bq_sa_key_path).exists():
             sa_key = json.loads(Path(self.config.bq_sa_key_path).read_text())
-        return {
+        body: dict[str, Any] = {
             "event_date": event_date,
             "apps": apps,
             "sources": self._build_sources_block(source),
@@ -857,6 +939,9 @@ class AdingestClient:
                 "sa_key": sa_key,
             }},
         }
+        if self.config.test_devices:
+            body["test_device_ids"] = [d.id for d in self.config.test_devices]
+        return body
 
     def _build_fetch_only_body(
         self, event_date: str, source: str, apps: list[dict[str, Any]]
@@ -868,12 +953,15 @@ class AdingestClient:
         ``check_destinations_present`` validator accepts a missing
         ``destinations`` iff ``fetch_only`` is true.
         """
-        return {
+        body: dict[str, Any] = {
             "event_date": event_date,
             "apps": apps,
             "sources": self._build_sources_block(source),
             "fetch_only": True,
         }
+        if self.config.test_devices:
+            body["test_device_ids"] = [d.id for d in self.config.test_devices]
+        return body
 
 
 # --- Verdict classifier -----------------------------------------------------
@@ -928,10 +1016,20 @@ class VerdictClassifier:
         o = int(source.get("rows_inserted_orphan", 0))
         ga = int(source.get("ga4_events_attempted", 0))
         go = int(source.get("ga4_events_skipped_orphan", 0))
+        # Engine-seam test-device drops (core-test-device-exclusion). These rows
+        # are fetched-then-dropped BEFORE the writer, so the row-balance identity
+        # is ``f == inv + x + d + i`` (fetched = invalid + test-device + dedup +
+        # inserted). All three ``(f - inv)``-keyed triggers below MUST subtract
+        # ``x`` or a fire touching a test device mis-classifies: at ``x > 0`` the
+        # raw ``i == f - inv`` never holds (kept rows fall short by ``x``), so
+        # BOTH healthy triggers go silent (blank verdict) AND ``silent-drop``
+        # false-fires on ``i < f - inv - d``. Subtracting ``x`` restores the
+        # healthy verdict. At ``x == 0`` every trigger reduces to its prior form.
+        x = int(source.get("rows_skipped_test_device", 0))
         triggers: list[int] = []
-        if f > 0 and i == (f - inv) and d == 0:
+        if f > 0 and i == (f - inv - x) and d == 0:
             triggers.append(0)
-        if f > 0 and d == (f - inv) and i == 0:
+        if f > 0 and d == (f - inv - x) and i == 0:
             triggers.append(1)
         if f > 0 and i > 0 and d > 0:
             triggers.append(2)
@@ -943,7 +1041,7 @@ class VerdictClassifier:
             triggers.append(5)
         if ga > 0 and (go / ga) > 0.5:
             triggers.append(6)
-        if i < (f - inv - d):
+        if i < (f - inv - x - d):
             triggers.append(7)
         triggers.sort(key=lambda t: (cls.TIER_RANK[cls.VERDICTS[t][1]], t))
         return [cls.VERDICTS[t][0] for t in triggers]
@@ -1005,18 +1103,22 @@ def _format_uid_pct(inserted: int, orphan: int) -> str:
 class TableRenderer:
     """Renders a job-status response as verdict-annotated rich table(s)."""
 
-    COLS = ("Key", "fetched", "invalid", "skipped_dedup", "inserted", "orphan", "%uid", "verdict")
+    COLS = ("Key", "fetched", "invalid", "skipped_dedup", "skipped_test",
+            "inserted", "orphan", "%uid", "verdict")
 
     def __init__(self, console: Console | None = None) -> None:
         self.console = console or Console()
 
-    def render(self, response: dict[str, Any]) -> None:
+    def render(
+        self, response: dict[str, Any], device_names: list[str] | None = None
+    ) -> None:
         job_id = response.get("job_id", "?")
         status = response.get("status", "?")
         dur = self._duration(response)
         self.console.print(f"Job {job_id}  status={status}  {dur}".rstrip())
         for source_name, source in response.get("sources", {}).items():
             self._render_source(source_name, source)
+        self._maybe_render_roster(response, device_names)
         for err in response.get("errors") or []:
             self.console.print(f"[red]error:[/red] {err}")
 
@@ -1032,7 +1134,12 @@ class TableRenderer:
                 ins = int(app.get("rows_inserted", 0))
                 orp = int(app.get("rows_inserted_orphan", 0))
                 slugs = VerdictClassifier.classify(_per_app_counters(source, app))
-                table.add_row(key, "⋯", "⋯", "⋯", str(ins), str(orp),
+                # Per-app rows carry no engine-seam skip breakdown (skipped_test
+                # is a source-level counter — Open Question 4 defers per-device
+                # attribution), so the extra column renders ``⋯`` like the other
+                # writer-boundary counters. The 4th ``⋯`` keeps COLS-aligned with
+                # the source-total row's ``skipped_test`` value below.
+                table.add_row(key, "⋯", "⋯", "⋯", "⋯", str(ins), str(orp),
                               _format_uid_pct(ins, orp), VerdictClassifier.display(slugs))
             table.add_section()
         ins = int(source.get("rows_inserted", 0))
@@ -1043,6 +1150,7 @@ class TableRenderer:
             str(source.get("rows_fetched", 0)),
             str(source.get("rows_invalid", 0)),
             str(source.get("rows_skipped_dedup", 0)),
+            str(source.get("rows_skipped_test_device", 0)),
             str(ins), str(orp),
             _format_uid_pct(ins, orp),
             VerdictClassifier.display(slugs),
@@ -1055,7 +1163,9 @@ class TableRenderer:
             f"failed={source.get('ga4_events_failed', 0)}"
         )
 
-    def render_fetch_only(self, response: dict[str, Any]) -> None:
+    def render_fetch_only(
+        self, response: dict[str, Any], device_names: list[str] | None = None
+    ) -> None:
         """Render a fetch-only job: per-source counters summary + a
         per-(platform, app_id) row breakdown derived CLI-side from the rows.
 
@@ -1076,6 +1186,7 @@ class TableRenderer:
             self._render_fetch_only_source(
                 source_name, source, rows_by_source.get(source_name) or []
             )
+        self._maybe_render_roster(response, device_names)
         for err in response.get("errors") or []:
             self.console.print(f"[red]error:[/red] {err}")
 
@@ -1092,6 +1203,7 @@ class TableRenderer:
             f"Source: {source_name}  "
             f"fetched={source.get('rows_fetched', 0)}  "
             f"invalid={source.get('rows_invalid', 0)}  "
+            f"skipped_test={source.get('rows_skipped_test_device', 0)}  "
             f"verdict={VerdictClassifier.display(slugs)}".rstrip()
         )
         breakdown = Counter(
@@ -1103,6 +1215,47 @@ class TableRenderer:
         for (platform, app_id), count in sorted(breakdown.items()):
             table.add_row(platform, app_id, str(count))
         self.console.print(table)
+
+    def _maybe_render_roster(
+        self, response: dict[str, Any], device_names: list[str] | None
+    ) -> None:
+        """Render the configured test-device roster ONCE at job scope, but only
+        when the job actually dropped ≥1 test-device row.
+
+        Gating on the summed ``rows_skipped_test_device`` (not merely on a
+        non-empty config) means a stale/perished ID that stopped matching shows
+        no roster — the absent roster is itself the operator's signal that the
+        list matched nothing (design Open Question 1: the guard rests on the
+        counter being watched). Called after the per-source loop in BOTH
+        ``render`` and ``render_fetch_only`` so a multi-source response renders
+        the global-config roster once, never per-source.
+        """
+        if not device_names:
+            return
+        total_skipped = sum(
+            int(s.get("rows_skipped_test_device", 0))
+            for s in response.get("sources", {}).values()
+        )
+        if total_skipped > 0:
+            self._render_roster(device_names)
+
+    def _render_roster(self, device_names: list[str]) -> None:
+        """Print the configured test-device roster BY NAME — never raw IDs.
+
+        Logs the operator-authored ``name`` labels (PII-safe) and the configured
+        count only; the advertising IDs (``idfa``/``idfv``) never reach any
+        rendered surface. An entry configured without a ``name`` (``name=""``,
+        the soft-warn path in ``_parse_test_devices``) renders as ``(unnamed)``
+        so the roster length stays honest. Per-device match attribution is
+        deferred (design Open Question 4) — this is the "which devices are
+        configured" roster; the scalar ``skipped_test`` counter is the "how
+        much" surface.
+        """
+        labels = [name if name else "(unnamed)" for name in device_names]
+        self.console.print(
+            f"Test-device exclusions ({len(device_names)} configured): "
+            + ", ".join(labels)
+        )
 
     @staticmethod
     def _duration(response: dict[str, Any]) -> str:
@@ -1518,14 +1671,20 @@ def _iter_dates(start: date, end: date) -> Iterator[date]:
         cur = cur + timedelta(days=1)
 
 
-def _emit(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
+def _emit(
+    response: dict[str, Any], as_json: bool, quiet: bool,
+    device_names: list[str] | None = None,
+) -> None:
     if as_json:
+        # The raw ``--json`` envelope has no roster surface — it already carries
+        # ``rows_skipped_test_device`` per source (the server counter flows
+        # through the deep-copy untouched). ``device_names`` is human-mode only.
         click.echo(json.dumps(_merge_verdicts_into_response(response)))
         return
     if not quiet:
         # Force a wide console: rich's default 80-col falls back when stdout is
         # not a TTY, which truncates the verdict column under CliRunner / pipes.
-        TableRenderer(Console(width=160)).render(response)
+        TableRenderer(Console(width=160)).render(response, device_names)
 
 
 def _flatten_fetch_only_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1544,7 +1703,10 @@ def _flatten_fetch_only_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
     return flat
 
 
-def _emit_fetch_only(response: dict[str, Any], as_json: bool, quiet: bool) -> None:
+def _emit_fetch_only(
+    response: dict[str, Any], as_json: bool, quiet: bool,
+    device_names: list[str] | None = None,
+) -> None:
     """Emit a terminal fetch-only job: bare rows → stdout, counters → stderr.
 
     ``--json``: the flattened rows array (``json.dumps``) is written to STDOUT as
@@ -1576,10 +1738,13 @@ def _emit_fetch_only(response: dict[str, Any], as_json: bool, quiet: bool) -> No
             envelope = _merge_verdicts_into_response(response)
             envelope.pop("rows_by_source", None)
             envelope.pop("fetch_only", None)
+            # ``rows_skipped_test_device`` rides the stderr envelope per source
+            # (server counter, carried through the deep-copy). No roster on the
+            # raw ``--json`` channel — ``device_names`` is human-mode only.
             click.echo(json.dumps(envelope), err=True)
         return
     if not quiet:
-        TableRenderer(Console(width=160)).render_fetch_only(response)
+        TableRenderer(Console(width=160)).render_fetch_only(response, device_names)
 
 
 def _common(f: Any) -> Any:
@@ -1630,7 +1795,7 @@ def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_fil
     resp = client.post_ingest(event_date, _resolve_source(source, stub), cfg.apps)
     if poll and resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
-    _emit(resp, as_json, quiet)
+    _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
 
 
 @cli.command(name="fetch-only")
@@ -1672,7 +1837,7 @@ def fetch_only(
     resp = client.post_fetch_only(event_date, _resolve_source(source, stub), cfg.apps)
     if resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
-    _emit_fetch_only(resp, as_json, quiet)
+    _emit_fetch_only(resp, as_json, quiet, [d.name for d in cfg.test_devices])
     # Strict exit: only a terminal ``complete`` is success. ``partial`` /
     # ``failed`` / a non-terminal poll-timeout body all exit non-zero — the
     # rows (or ``[]``) have already been emitted above, so a partial run still
@@ -1709,7 +1874,7 @@ def range_cmd(
         resp = client.post_ingest(day.isoformat(), src, cfg.apps)
         if poll and resp.get("job_id"):
             resp = client.poll_until_terminal(resp["job_id"])
-        _emit(resp, as_json, quiet)
+        _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
         if resp.get("status") == "failed" and not continue_on_failure:
             sys.exit(1)
 
@@ -1722,7 +1887,7 @@ def status(job_id: str, project: str | None, url: str | None, token: str | None,
     """GET status for JOB_ID."""
     cfg = _build_config(project, url, token, None)
     resp = AdingestClient(cfg).get_job(job_id)
-    _emit(resp, as_json, quiet)
+    _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
 
 
 @cli.command()
