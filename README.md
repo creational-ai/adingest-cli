@@ -7,6 +7,7 @@ Single-file CLI for the [ad-ingest](https://api.creational.ai/adingest) service.
 * `adingest status <JOB_ID>` — re-render the table for an existing job
 * `adingest upgrade` — atomic self-replace via service manifest + sha256-verified bytes from this mirror
 * `adingest fetch-only 2026-05-12 --json` — pipeable canonical revenue rows on stdout, **zero writes** (no BQ, no GA4, no dedup); validate a caller's config with no destination credentials
+* `[[exclusions.test_devices]]` config — drop known test-phone REVENUE rows before BQ + GA4, counted per source as `skipped_test` (observable, never silent)
 * 9-category verdict classifier (`✅ healthy-fresh`, `🚨 silent-drop`, `✅ fetch-only`, …) — one-glance health per source and per app-platform rollup
 * PEP 723 single-file Python script — [uv](https://docs.astral.sh/uv/) resolves inline deps on first run; no `pip install`, no virtualenv
 
@@ -58,11 +59,11 @@ First use — stub mode exercises the full wire path without upstream credential
 $ adingest ingest 2026-05-12 --stub --poll
 Job ing_01KRJ7JA498C40JK1RMA0XHZNC  status=complete  1.9s
 Source: stub
-┏━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
-┃ Key          ┃ fetched ┃ invalid ┃ skipped_dedup ┃ inserted ┃ orphan ┃ %uid   ┃ verdict          ┃
-┡━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
-│ source total │ 3       │ 0       │ 0             │ 3        │ 0      │ 100%   │ ✅ healthy-fresh │
-└──────────────┴─────────┴─────────┴───────────────┴──────────┴────────┴────────┴──────────────────┘
+┏━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃ Key          ┃ fetched ┃ invalid ┃ skipped_dedup ┃ skipped_test ┃ inserted ┃ orphan ┃ %uid ┃ verdict          ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━━━━━━┩
+│ source total │ 3       │ 0       │ 0             │ 0            │ 3        │ 0      │ 100% │ ✅ healthy-fresh │
+└──────────────┴─────────┴─────────┴───────────────┴──────────────┴──────────┴────────┴──────┴──────────────────┘
 GA4: attempted=3  sent=3  skipped_orphan=0  failed=0
 ```
 
@@ -138,8 +139,8 @@ Add an `[[exclusions.test_devices]]` array to a `config.toml`. The global file (
 
 ```toml
 [[exclusions.test_devices]]
-name = "Dominic Galaxy S23"            # required — an operator label; shown in the summary, never sent to the service
-id   = "495d5f3e-0000-4a1b-9c2d-1234"  # the device's advertising ID (idfa on iOS, idfv / GAID on Android)
+name = "Dominic Galaxy S23"            # recommended — an operator label; shown in the roster, never sent to the service (omit it and the device still filters, rendered as "(unnamed)")
+id   = "495d5f3e-0000-4a1b-9c2d-1234"  # required — the device's advertising ID (idfa on iOS, GAID on Android)
 
 [[exclusions.test_devices]]
 name = "QA iPhone 14"
@@ -147,7 +148,7 @@ id   = "8f14e45f-ceea-467a-9f1b-5678"
 ```
 
 - **What crosses the wire.** Only `id` is sent — flattened onto the `test_device_ids` wire field. `name` stays caller-side and is used solely for the by-name roster the CLI prints when rows are dropped. A raw advertising ID never appears in any rendered output (counts and operator-authored names only).
-- **Matching is case-insensitive and whitespace-trimmed.** Each configured `id` and each row's `idfa` / `idfv` is normalized (`.strip().lower()`) before comparison, so a mixed-case or space-padded ID still matches. A row carrying no `idfa` / `idfv` is simply never a match.
+- **Matching is case-insensitive.** Each configured `id` is normalized (`.strip().lower()`) and compared against each row's `idfa` / `idfv`, lower-cased at the engine seam — so a mixed-case (or space-padded) config value still matches. A row carrying no `idfa` / `idfv` is simply never a match.
 - **The all-zeros ID is rejected.** `00000000-0000-0000-0000-000000000000` is the platform opt-out sentinel — the ID reported for a user who disabled ad tracking (**Android 12+ / iOS 14.5+** behavior; it is *not* a universal "null device" across all platforms). Configuring it returns `422 test-device-id-invalid` rather than silently excluding every opted-out user.
 - **Per-slug overrides — it does not extend.** A per-project `[[exclusions.test_devices]]` block **replaces** the global roster wholesale for that slug (config arrays merge by replacement, never union). If a slug's `skipped_test` unexpectedly drops to 0, check whether a per-slug `[exclusions]` block silently shadowed the global list.
 
@@ -165,7 +166,7 @@ POST one ingest for a single `EVENT_DATE` (ISO date, `YYYY-MM-DD`). Returns imme
 $ adingest ingest 2026-05-12 --poll
 Job ing_01KRJ7JA498C40JK1RMA0XHZNC  status=complete  4.9s
 Source: levelplay
-│ source total │ 955     │ 0       │ 0             │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
+│ source total │ 955     │ 0       │ 0             │ 0            │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
 GA4: attempted=955  sent=949  skipped_orphan=6  failed=0
 ```
 
@@ -175,7 +176,7 @@ Same date re-run — dedup path:
 $ adingest ingest 2026-05-12 --poll
 Job ing_01KRJ7AM15A2Z4C5M91RXW6STF  status=complete  1.8s
 Source: levelplay
-│ source total │ 955     │ 0       │ 955           │ 0        │ 0      │ —      │ ✅ healthy-dedup │
+│ source total │ 955     │ 0       │ 955           │ 0            │ 0        │ 0      │ —      │ ✅ healthy-dedup │
 GA4: attempted=0  sent=0  skipped_orphan=0  failed=0
 ```
 
@@ -199,15 +200,15 @@ Fire one ingest per day in `START..END` (inclusive). Useful for backfills.
 ```bash
 $ adingest range 2026-05-10..2026-05-12 --poll
 Job ing_01KRJ79J5DQPX2YANKD6PWTHMP  status=complete  6.7s
-│ source total │ 1,394   │ 0       │ 0             │ 1,394    │ 594    │ 57.4%  │ ✅ healthy-fresh │
+│ source total │ 1,394   │ 0       │ 0             │ 0            │ 1,394    │ 594    │ 57.4%  │ ✅ healthy-fresh │
 GA4: attempted=1394  sent=800  skipped_orphan=594  failed=0
 
 Job ing_01KRJ79T2CS79C98KRHS758TXX  status=complete  4.6s
-│ source total │ 1,412   │ 0       │ 0             │ 1,412    │ 378    │ 73.2%  │ ✅ healthy-fresh │
+│ source total │ 1,412   │ 0       │ 0             │ 0            │ 1,412    │ 378    │ 73.2%  │ ✅ healthy-fresh │
 GA4: attempted=1412  sent=1034  skipped_orphan=378  failed=0
 
 Job ing_01KRJ7AM15A2Z4C5M91RXW6STF  status=complete  5.2s
-│ source total │ 955     │ 0       │ 0             │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
+│ source total │ 955     │ 0       │ 0             │ 0            │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
 GA4: attempted=955  sent=949  skipped_orphan=6  failed=0
 ```
 
@@ -227,7 +228,7 @@ Re-render the table for an existing `JOB_ID`. Jobs persist for the lifetime of t
 $ adingest status ing_01KRJ7JA498C40JK1RMA0XHZNC
 Job ing_01KRJ7JA498C40JK1RMA0XHZNC  status=complete  4.9s
 Source: levelplay
-│ source total │ 955     │ 0       │ 0             │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
+│ source total │ 955     │ 0       │ 0             │ 0            │ 955      │ 6      │ 99.4%  │ ✅ healthy-fresh │
 GA4: attempted=955  sent=949  skipped_orphan=6  failed=0
 ```
 
