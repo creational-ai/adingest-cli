@@ -35,6 +35,7 @@ import httpx
 import tomli_w
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 # --- Module constants -------------------------------------------------------
 
@@ -42,13 +43,118 @@ from rich.table import Table
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
 #: manifest's ``product`` field: a mismatch means the operator pointed the
 #: CLI at a different Creational product's server and the upgrade is refused.
 PRODUCT = "adingest"
+
+# --- Secret classification (mirror of src/ad_ingest/log_setup.py) -----------
+#
+# ``config show`` masks credential-shaped values by default (see the
+# ``config show`` section near the bottom of this file for the ruling that
+# reversed the original literal-rendering decision). The classification of
+# "what counts as a secret" is the PROJECT'S, not the CLI's: it lives in
+# ``src/ad_ingest/log_setup.py:DENY_FIELDS`` and drives the structlog
+# redactor for the whole service.
+#
+# It is MIRRORED rather than imported because this file is a standalone PEP
+# 723 script — ``/deploy`` installs it to ``~/.local/share/adingest/adingest``
+# with no ``ad_ingest`` package alongside it, and the module docstring's "NO
+# imports of ``ad_ingest.*``" invariant is load-bearing for that. The mirror
+# is DRIFT-GUARDED: ``TestDenyFieldsMirror`` in
+# ``tests/test_core_cli_config_show_masking.py`` imports both and fails if
+# the sets diverge. Add a field to ``log_setup`` — never only here.
+_DENY_FIELDS: frozenset[str] = frozenset(
+    {
+        "secret_key",
+        "refresh_token",
+        "token",
+        "sa_key",
+        "api_secret",
+        "password",
+        "creds",
+        "credentials",
+        "sources",
+    }
+)
+
+#: Pre-normalized once at import — the deny set is authored snake_case, so it
+#: must go through the same normalizer as the incoming key before any
+#: membership test. (Comparing a normalized key against the RAW set silently
+#: stops matching ``secret_key`` / ``api_secret``; the sentinel acceptance
+#: test catches exactly that.)
+_NORMALIZED_DENY: frozenset[str] = frozenset(
+    f.lower().replace("_", "").replace("-", "") for f in _DENY_FIELDS
+)
+
+#: Rendered for a secret field whose value is EMPTY. Deliberately NOT
+#: mask-shaped: an absent credential rendering as a mask is
+#: absence-reading-as-success on a credential — the operator must be able to
+#: tell "this is set, I just can't see it" from "this is not set at all".
+UNSET_VALUE = "(unset)"
+
+
+def _normalize_field(s: str) -> str:
+    """Lower-case AND strip ``_`` / ``-`` — mirrors ``log_setup._normalize``."""
+    return s.lower().replace("_", "").replace("-", "")
+
+
+def _is_secret_key(key: str) -> bool:
+    """True if ``key`` names a credential per :data:`_DENY_FIELDS`.
+
+    Matching is SEGMENT-SUFFIX, not the service redactor's exact-match. The
+    service sees wire-schema field names verbatim (``secret_key``,
+    ``refresh_token``); the CLI sees the *dataclass* spellings, which carry a
+    source prefix — ``lp_secret_key``, ``lp_refresh_token``. Exact matching
+    misses all of those (verified empirically, not reasoned about: only
+    ``api_secret`` was caught).
+
+    So a key matches if any suffix of its ``_``/``-`` segments normalizes into
+    the deny set::
+
+        lp_secret_key    → {"key", "secretkey", "lpsecretkey"}    → hit
+        lp_refresh_token → {"token", "refreshtoken", ...}         → hit
+        token            → {"token"}                              → hit
+        api_secret       → {"secret", "apisecret"}                → hit
+        bq_sa_key_path   → {"path", "keypath", "sakeypath", ...}  → miss (a
+                           filesystem path, not the key material)
+        measurement_id   → {"id", "measurementid"}                → miss
+
+    Segment-aware suffixing (not raw string ``endswith``) is what keeps
+    ``resources`` from matching ``sources``.
+
+    The CLI therefore masks a SUPERSET of what the service redacts, which is
+    the safe direction for a security control; the drift guard asserts the
+    underlying deny sets stay identical.
+    """
+    segments = re.split(r"[_-]", key)
+    return any(
+        _normalize_field("".join(segments[i:])) in _NORMALIZED_DENY
+        for i in range(len(segments))
+    )
+
+
+def _mask_secret(value: str) -> str:
+    """Mask a credential for display, preserving its debugging affordances.
+
+    Shape is prefix…suffix plus a length, NOT a fixed ``****``: the real use
+    of ``config show`` on a secret is *did my edit land, is the value present,
+    is it the one I think it is* — ``THAX…ZE8 (48 chars)`` answers all three
+    without putting the credential on stdout, in scrollback, or in a
+    transcript.
+
+    Short values reveal nothing but their length: showing 4+3 characters of an
+    8-character secret is not masking it.
+    """
+    if not value:
+        return UNSET_VALUE
+    if len(value) < 12:
+        return f"…({len(value)} chars)"
+    return f"{value[:4]}…{value[-3:]} ({len(value)} chars)"
+
 
 # --- Config -----------------------------------------------------------------
 
@@ -57,19 +163,32 @@ PRODUCT = "adingest"
 class TestDevice:
     """A caller-declared test device whose REVENUE rows are excluded server-side.
 
-    Two fields: an operator-authored ``name`` (a human label — safe to render
-    in logs/summaries) and the advertising ``id`` (idfa/idfv) matched against
-    each revenue row. Only ``id`` is flattened onto the wire
-    (``test_device_ids``); ``name`` stays caller-side and is used solely for the
-    named roster the CLI renders when rows are dropped (counts only, never IDs).
+    **One record per PHYSICAL DEVICE**, carrying every advertising identifier
+    that device has ever minted. This is the shape the schema should always
+    have had: a phone mints a new IDFV per install (one operator handset
+    produced three in ~3 weeks, two of them concurrent), so the relationship
+    is 1 device → N identifiers. The previous one-row-per-identifier schema
+    flattened that into N sibling entries, and a count of entries then read as
+    a count of devices — which misled once already, on the roster that decides
+    what is excluded from revenue.
 
-    Frozen so a parsed roster is immutable once loaded. ``name`` may be ``""``
-    for an entry that omitted its label (``_parse_test_devices`` warns rather
-    than fails) — matching is keyed on ``id``, so a nameless entry still filters;
-    the roster renders it as an unlabeled device rather than degrading silently.
+    Fields:
+
+    * ``name`` — operator-authored human label. Safe to render in logs and
+      summaries; this is the ONLY device attribute that reaches a rendered
+      surface. May be ``""`` (``_parse_test_devices`` warns rather than
+      fails); matching keys on the ids, so a nameless entry still filters and
+      the roster renders it as ``(unnamed)``.
+    * ``platform`` — optional, documentation only. Never sent, never matched.
+    * ``ids`` — the advertising identifiers (idfa/idfv) matched against each
+      revenue row. A ``tuple`` so the frozen record stays genuinely immutable.
+      Flattened onto the wire as ``test_device_ids``, a flat list of strings —
+      the nesting is caller-side ONLY, so this schema change touches no API
+      contract (see ``AdingestClient._build_body``).
     """
     name: str
-    id: str
+    ids: tuple[str, ...] = ()
+    platform: str = ""
 
 
 @dataclass(frozen=True)
@@ -227,20 +346,50 @@ def _interpolate_env_recursive(value: Any) -> Any:
 def _parse_test_devices(raw: list[dict[str, Any]]) -> list[TestDevice]:
     """Translate ``[[exclusions.test_devices]]`` entries to ``TestDevice`` records.
 
-    Each entry is a TOML table with a required ``id`` (the advertising
-    identifier — idfa/idfv — matched server-side against revenue rows) and a
-    recommended ``name`` (an operator-authored human label).
+    Each entry is a TOML table describing ONE PHYSICAL DEVICE::
+
+        [[exclusions.test_devices]]
+        name = "operator iPhone 16"
+        platform = "ios"                 # optional, documentation only
+        ids = [
+          "BB74B2F7-…",   # IDFA — device-level
+          "47D3C04D-…",   # IDFV — 07-01..07-21
+          "F783217A-…",   # IDFV — CONCURRENT with the above
+        ]
+
+    Per-element comments in a multi-line array are valid TOML, which gives
+    *why this identifier exists* a home next to the identifier itself.
 
     Contract:
 
-    * Missing ``id`` is a HARD ERROR — ``click.ClickException`` naming the
-      offending entry. An entry that can't be matched on is a config mistake
-      the operator must fix, not silently drop (a silently-dropped device
-      would keep polluting BQ with the operator none the wiser).
+    * **``ids`` is REQUIRED and must be a non-empty list of non-empty
+      strings.** Absent, a scalar, an empty list, or a blank element is a
+      HARD ERROR naming the entry. An entry that can't be matched on is a
+      config mistake the operator must fix, not something to silently drop:
+      a dropped device keeps polluting BQ with the operator none the wiser.
+      This is the old parser's fail-loud property, preserved and widened —
+      never fail open.
+    * **The scalar ``id`` is NOT accepted.** An entry carrying it is a hard
+      error that names the key AND names its replacement, so the remedy is
+      in the message rather than in a doc.
+
+      A one-element ``ids`` array already IS the single-identifier case, so
+      a second accepted spelling would buy a transient migration at the cost
+      of permanent complexity — two ways to say one thing is the shape that
+      drifts and has to be un-picked later.
+
+      ⚠ **This makes the CLI and the config a PAIRED update, per host.** The
+      break is symmetric: a new CLI reading an old ``id`` config hard-errors
+      on the missing ``ids``, and an old CLI reading a new ``ids`` config
+      hard-errors on the missing ``id``. There is no ordering that avoids a
+      window — so the CLI and ``config.toml`` must be updated together, as
+      ONE step, on every host that can fire (Mac AND Genesis; the two config
+      files are host-specific and are NOT synced —
+      ``sync-creds-to-genesis.sh`` carries ``.env`` only).
     * Missing ``name`` is a SOFT WARNING (stderr) — the entry is kept with
-      ``name=""``. Matching keys on ``id``, so a nameless entry still filters;
-      the roster later renders it as an unlabeled device rather than failing
-      the whole run over a cosmetic omission.
+      ``name=""``. Matching keys on the ids, so a nameless entry still
+      filters; the roster renders it as ``(unnamed)`` rather than failing the
+      whole run over a cosmetic omission.
 
     This helper carries the only raise in the config-translation path so
     ``_to_adingest_config`` stays "structural only" — the fail-loud validation
@@ -255,30 +404,73 @@ def _parse_test_devices(raw: list[dict[str, Any]]) -> list[TestDevice]:
         A list of frozen ``TestDevice`` records, order-preserving.
 
     Raises:
-        click.ClickException: an entry omits ``id`` (message names the entry).
+        click.ClickException: an entry carries the removed scalar ``id``, or
+            omits ``ids``, or gives an ``ids`` that is not a non-empty list of
+            non-empty strings. The message names the offending entry.
 
     Examples::
 
-        >>> _parse_test_devices([{"name": "Galaxy", "id": "495d..."}])
-        [TestDevice(name='Galaxy', id='495d...')]
+        >>> _parse_test_devices([{"name": "Galaxy", "ids": ["495d...", "a1b..."]}])
+        [TestDevice(name='Galaxy', ids=('495d...', 'a1b...'), platform='')]
     """
     devices: list[TestDevice] = []
     for entry in raw:
-        device_id = entry.get("id")
-        if not device_id:
+        # Checked BEFORE the missing-``ids`` case so an un-migrated entry gets
+        # the message that tells it what to do, not a bare "missing 'ids'".
+        if "id" in entry:
             raise click.ClickException(
-                f"test_devices entry missing required 'id': {entry!r}"
+                "test_devices entry uses the removed scalar 'id'; replace it "
+                "with an 'ids' array — ids = [\"<the-id>\"] — one entry per "
+                f"physical device, all of its identifiers in the array: {entry!r}"
             )
+        if "ids" not in entry:
+            raise click.ClickException(
+                f"test_devices entry missing required 'ids': {entry!r}"
+            )
+
+        raw_ids = entry["ids"]
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise click.ClickException(
+                "test_devices entry 'ids' must be a non-empty array of "
+                f"identifier strings: {entry!r}"
+            )
+        ids: list[str] = []
+        for element in raw_ids:
+            if not isinstance(element, str) or not element.strip():
+                raise click.ClickException(
+                    "test_devices entry has an empty/non-string element in "
+                    f"'ids': {entry!r}"
+                )
+            ids.append(element)
+
         name = entry.get("name")
         if not name:
             click.echo(
-                f"warning: test_devices entry {device_id!r} has no 'name'; "
+                f"warning: test_devices entry {ids[0]!r} has no 'name'; "
                 "it will filter but render unlabeled in the roster",
                 err=True,
             )
             name = ""
-        devices.append(TestDevice(name=str(name), id=str(device_id)))
+        devices.append(
+            TestDevice(
+                name=str(name),
+                ids=tuple(ids),
+                platform=str(entry.get("platform") or ""),
+            )
+        )
     return devices
+
+
+def _flatten_device_ids(devices: list[TestDevice]) -> list[str]:
+    """Flatten a per-device roster to the wire's flat ``test_device_ids`` list.
+
+    The 1-device→N-identifier nesting is CALLER-SIDE ONLY. The server contract
+    is, and stays, a flat array of identifier strings — which is precisely why
+    the per-device schema costs no API change, no service deploy, and no
+    gateway re-pin. Order-preserving (device order, then id order within a
+    device) so a diff of two runs' bodies stays readable.
+    """
+    return [device_id for device in devices for device_id in device.ids]
 
 
 def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
@@ -940,7 +1132,7 @@ class AdingestClient:
             }},
         }
         if self.config.test_devices:
-            body["test_device_ids"] = [d.id for d in self.config.test_devices]
+            body["test_device_ids"] = _flatten_device_ids(self.config.test_devices)
         return body
 
     def _build_fetch_only_body(
@@ -960,7 +1152,7 @@ class AdingestClient:
             "fetch_only": True,
         }
         if self.config.test_devices:
-            body["test_device_ids"] = [d.id for d in self.config.test_devices]
+            body["test_device_ids"] = _flatten_device_ids(self.config.test_devices)
         return body
 
 
@@ -1110,7 +1302,7 @@ class TableRenderer:
         self.console = console or Console()
 
     def render(
-        self, response: dict[str, Any], device_names: list[str] | None = None
+        self, response: dict[str, Any], devices: list[TestDevice] | None = None
     ) -> None:
         job_id = response.get("job_id", "?")
         status = response.get("status", "?")
@@ -1118,7 +1310,7 @@ class TableRenderer:
         self.console.print(f"Job {job_id}  status={status}  {dur}".rstrip())
         for source_name, source in response.get("sources", {}).items():
             self._render_source(source_name, source)
-        self._maybe_render_roster(response, device_names)
+        self._maybe_render_roster(response, devices)
         for err in response.get("errors") or []:
             self.console.print(f"[red]error:[/red] {err}")
 
@@ -1164,7 +1356,7 @@ class TableRenderer:
         )
 
     def render_fetch_only(
-        self, response: dict[str, Any], device_names: list[str] | None = None
+        self, response: dict[str, Any], devices: list[TestDevice] | None = None
     ) -> None:
         """Render a fetch-only job: per-source counters summary + a
         per-(platform, app_id) row breakdown derived CLI-side from the rows.
@@ -1186,7 +1378,7 @@ class TableRenderer:
             self._render_fetch_only_source(
                 source_name, source, rows_by_source.get(source_name) or []
             )
-        self._maybe_render_roster(response, device_names)
+        self._maybe_render_roster(response, devices)
         for err in response.get("errors") or []:
             self.console.print(f"[red]error:[/red] {err}")
 
@@ -1217,7 +1409,7 @@ class TableRenderer:
         self.console.print(table)
 
     def _maybe_render_roster(
-        self, response: dict[str, Any], device_names: list[str] | None
+        self, response: dict[str, Any], devices: list[TestDevice] | None
     ) -> None:
         """Render the configured test-device roster ONCE at job scope, but only
         when the job actually dropped ≥1 test-device row.
@@ -1230,31 +1422,66 @@ class TableRenderer:
         ``render`` and ``render_fetch_only`` so a multi-source response renders
         the global-config roster once, never per-source.
         """
-        if not device_names:
+        if not devices:
             return
         total_skipped = sum(
             int(s.get("rows_skipped_test_device", 0))
             for s in response.get("sources", {}).values()
         )
         if total_skipped > 0:
-            self._render_roster(device_names)
+            self._render_roster(devices)
 
-    def _render_roster(self, device_names: list[str]) -> None:
+    def _render_roster(self, devices: list[TestDevice]) -> None:
         """Print the configured test-device roster BY NAME — never raw IDs.
 
-        Logs the operator-authored ``name`` labels (PII-safe) and the configured
-        count only; the advertising IDs (``idfa``/``idfv``) never reach any
-        rendered surface. An entry configured without a ``name`` (``name=""``,
-        the soft-warn path in ``_parse_test_devices``) renders as ``(unnamed)``
-        so the roster length stays honest. Per-device match attribution is
-        deferred (design Open Question 4) — this is the "which devices are
-        configured" roster; the scalar ``skipped_test`` counter is the "how
-        much" surface.
+        Logs the operator-authored ``name`` labels and the two counts only.
+
+        **The invariant is narrower than "raw ids never render anywhere", and
+        the narrowness is deliberate.** The rule is: raw advertising ids never
+        reach an **unattended, accumulating** surface. This roster is job
+        output — emitted on every daily run into logs that pile up forever and
+        that nobody reads — so it carries names only. ``config show`` is
+        operator-invoked, on demand, to answer "is this the roster I think it
+        is", and it prints the ids in full. **Both are correct.** Do not
+        "restore consistency" by masking ``config show``: an earlier reading of
+        this docstring as a blanket ban is exactly the trap this paragraph
+        exists to disarm.
+
+        Why ``config show`` must NOT mask ids, as a contract rather than a
+        preference: a **secret** needs presence + identity, which
+        ``THAX…ZE8 (48 chars)`` fully answers. An **identifier** needs
+        whole-value comparison against an external system — you look at it
+        precisely to check it against what BigQuery or LevelPlay shows.
+        ``BB74…C65`` cannot be compared to a BQ row. Masking there would not
+        make the command less useful, it would make it USELESS for its most
+        load-bearing use: verifying an idfv after a rotation.
+
+        An entry configured without a ``name`` (``name=""``, the soft-warn path
+        in ``_parse_test_devices``) renders as ``(unnamed)`` so the roster
+        length stays honest. Per-device match attribution is deferred (design
+        Open Question 4) — this is the "which devices are configured" roster;
+        the scalar ``skipped_test`` counter is the "how much" surface.
+
+        **Both quantities are named** — ``2 devices, 5 identifiers``. Reporting
+        a single count is what misled: under the old one-row-per-identifier
+        schema five entries covered two physical phones, and "5 configured"
+        read as five devices. The device count and the identifier count answer
+        different questions ("whose traffic is excluded" vs "how many install
+        generations are covered"), so both are stated even when they agree.
         """
-        labels = [name if name else "(unnamed)" for name in device_names]
+        labels = [device.name if device.name else "(unnamed)" for device in devices]
+        identifiers = sum(len(device.ids) for device in devices)
+        # ``Text`` (not an f-string) because ``name`` is HAND-TYPED operator
+        # config — the most likely place a bracket actually gets typed, now
+        # that the roster names devices instead of counting them. A bare str
+        # is parsed as console markup, so `operator [red]iPhone[/red] 16`
+        # would render as `operator iPhone 16` and the roster would silently
+        # disagree with the config file it is reporting.
         self.console.print(
-            f"Test-device exclusions ({len(device_names)} configured): "
-            + ", ".join(labels)
+            Text(
+                f"Test-device exclusions ({len(devices)} devices, "
+                f"{identifiers} identifiers): " + ", ".join(labels)
+            )
         )
 
     @staticmethod
@@ -1673,18 +1900,18 @@ def _iter_dates(start: date, end: date) -> Iterator[date]:
 
 def _emit(
     response: dict[str, Any], as_json: bool, quiet: bool,
-    device_names: list[str] | None = None,
+    devices: list[TestDevice] | None = None,
 ) -> None:
     if as_json:
         # The raw ``--json`` envelope has no roster surface — it already carries
         # ``rows_skipped_test_device`` per source (the server counter flows
-        # through the deep-copy untouched). ``device_names`` is human-mode only.
+        # through the deep-copy untouched). ``devices`` is human-mode only.
         click.echo(json.dumps(_merge_verdicts_into_response(response)))
         return
     if not quiet:
         # Force a wide console: rich's default 80-col falls back when stdout is
         # not a TTY, which truncates the verdict column under CliRunner / pipes.
-        TableRenderer(Console(width=160)).render(response, device_names)
+        TableRenderer(Console(width=160)).render(response, devices)
 
 
 def _flatten_fetch_only_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1705,7 +1932,7 @@ def _flatten_fetch_only_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _emit_fetch_only(
     response: dict[str, Any], as_json: bool, quiet: bool,
-    device_names: list[str] | None = None,
+    devices: list[TestDevice] | None = None,
 ) -> None:
     """Emit a terminal fetch-only job: bare rows → stdout, counters → stderr.
 
@@ -1740,11 +1967,11 @@ def _emit_fetch_only(
             envelope.pop("fetch_only", None)
             # ``rows_skipped_test_device`` rides the stderr envelope per source
             # (server counter, carried through the deep-copy). No roster on the
-            # raw ``--json`` channel — ``device_names`` is human-mode only.
+            # raw ``--json`` channel — ``devices`` is human-mode only.
             click.echo(json.dumps(envelope), err=True)
         return
     if not quiet:
-        TableRenderer(Console(width=160)).render_fetch_only(response, device_names)
+        TableRenderer(Console(width=160)).render_fetch_only(response, devices)
 
 
 def _common(f: Any) -> Any:
@@ -1795,7 +2022,7 @@ def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_fil
     resp = client.post_ingest(event_date, _resolve_source(source, stub), cfg.apps)
     if poll and resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
-    _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
+    _emit(resp, as_json, quiet, cfg.test_devices)
 
 
 @cli.command(name="fetch-only")
@@ -1837,7 +2064,7 @@ def fetch_only(
     resp = client.post_fetch_only(event_date, _resolve_source(source, stub), cfg.apps)
     if resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
-    _emit_fetch_only(resp, as_json, quiet, [d.name for d in cfg.test_devices])
+    _emit_fetch_only(resp, as_json, quiet, cfg.test_devices)
     # Strict exit: only a terminal ``complete`` is success. ``partial`` /
     # ``failed`` / a non-terminal poll-timeout body all exit non-zero — the
     # rows (or ``[]``) have already been emitted above, so a partial run still
@@ -1874,7 +2101,7 @@ def range_cmd(
         resp = client.post_ingest(day.isoformat(), src, cfg.apps)
         if poll and resp.get("job_id"):
             resp = client.poll_until_terminal(resp["job_id"])
-        _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
+        _emit(resp, as_json, quiet, cfg.test_devices)
         if resp.get("status") == "failed" and not continue_on_failure:
             sys.exit(1)
 
@@ -1887,7 +2114,7 @@ def status(job_id: str, project: str | None, url: str | None, token: str | None,
     """GET status for JOB_ID."""
     cfg = _build_config(project, url, token, None)
     resp = AdingestClient(cfg).get_job(job_id)
-    _emit(resp, as_json, quiet, [d.name for d in cfg.test_devices])
+    _emit(resp, as_json, quiet, cfg.test_devices)
 
 
 @cli.command()
@@ -2244,17 +2471,38 @@ def init(slug: str) -> None:
 # ``config.toml`` resolve through ``os.environ``), invokes ``load_config``,
 # and renders the resulting frozen :class:`AdingestConfig` as a rich Table.
 #
-# Output policy (per Open Question #2 in the design doc): secrets render
-# LITERAL, not redacted. Operators run ``config show`` to debug, and a
-# ``****`` mask would defeat the purpose; the file lives at mode 0600 under
-# ``~/.adingest/<slug>/.env`` and the operator is the only viewer.
+# Output policy: secrets are MASKED by default; ``--reveal`` opts in to
+# literal values. This REVERSES the original Open Question #2 decision
+# ("secrets render literal — the file is mode 0600 and the operator is the
+# only viewer"), which was a decision rather than an oversight, and is
+# reversed because its load-bearing premise is false:
+#
+#   * "The operator is the only viewer" was falsified in practice — a
+#     ``config show`` run to verify a config load put the caller bearer
+#     token, ``lp_secret_key``, ``lp_refresh_token`` and both GA4
+#     ``api_secret``s into a session transcript.
+#   * The mode-0600 argument reasons about the wrong artifact. 0600 protects
+#     the FILE; ``config show`` copies the secret OUT of the file into
+#     stdout, scrollback, screen shares and transcripts — channels with
+#     entirely different permissions.
+#   * ``src/ad_ingest/log_setup.py`` already enforces "credentials must not
+#     reach an output channel" project-wide, with a ``SystemExit(1)`` if the
+#     redactor is removed. ``config show`` was the single exception to a
+#     mechanically-enforced standard; an exception justified by a premise
+#     that no longer holds is just an inconsistency.
+#
+# Masking preserves the actual debugging use (see ``_mask_secret``): a
+# prefix/suffix plus length answers "did my edit land / is it present / is it
+# the one I think" without emitting the credential. ``--reveal`` is explicit
+# and single-purpose — deliberately NOT coupled to any verbosity flag, so no
+# future ``--verbose`` can turn secret disclosure on as a side effect.
 #
 # Apps list rendering (per Step 8 Specification + design Item 3): the
 # ``apps`` field is a list of dicts (each app's TOML structure carried
 # through verbatim per D14). Every leaf in every app dict gets its own
 # row with dot-notation key path — ``apps[0].app_id``, ``apps[0].ga4.api_secret``,
-# etc. No collapsing, no summarization — matches the no-redaction stance
-# from Open Question #2.
+# etc. No collapsing, no summarization — the structure is still fully
+# enumerated; only credential-shaped VALUES are masked.
 #
 # Cache short-circuit interaction: Step 5's ``_ACTIVE_PROJECT_CACHE`` is a
 # process-lifetime cache. Each CLI invocation is a fresh process, so the
@@ -2270,14 +2518,21 @@ def config_grp() -> None:
     """Inspect/manage caller config under ``~/.adingest/``."""
 
 
-def _render_config_table(cfg: AdingestConfig) -> None:
+def _render_config_table(cfg: AdingestConfig, reveal: bool = False) -> None:
     """Render an :class:`AdingestConfig` to stdout as a rich ``Table``.
 
-    Two columns: ``Key`` (dot-notation path) and ``Value`` (literal resolved
-    value — secrets NOT redacted per Open Question #2 in the design doc).
-    Every dataclass field gets a row; the ``apps`` list nests one row per
-    leaf using ``apps[i].<key>`` (and ``apps[i].ga4.<key>`` for the nested
-    sub-table) path notation per design Item 3.
+    Two columns: ``Key`` (dot-notation path) and ``Value``. Credential-shaped
+    values — classified by :func:`_is_secret_key` against the project-wide
+    ``DENY_FIELDS`` — are MASKED unless ``reveal`` is set; every other value
+    renders literally, so the structural inspection use of ``config show``
+    (which keys resolved, which paths expanded, which project won the
+    cascade) is untouched.
+
+    Every dataclass field gets a row; the ``apps`` list nests one row per leaf
+    using ``apps[i].<key>`` (and ``apps[i].ga4.<key>`` for the nested
+    sub-table) path notation per design Item 3. ``test_devices`` renders as a
+    ``N devices, M identifiers`` summary followed by per-device rows — the
+    entry count alone is what previously read as a device count.
 
     The renderer writes to a fresh :class:`Console` so output goes to
     ``sys.stdout``; tests capture via ``CliRunner.invoke``'s output channel.
@@ -2285,30 +2540,92 @@ def _render_config_table(cfg: AdingestConfig) -> None:
     Args:
         cfg: The validated config to render. Field order follows the
             dataclass declaration order; ``apps`` is always rendered last.
+        reveal: When True, print secrets literally. Opt-in only, from the
+            explicit ``--reveal`` flag — never inferred from another option.
     """
     from dataclasses import fields as dc_fields
+
+    def cell(key: str, value: Any) -> str:
+        """Literal value, or a mask when ``key`` is credential-shaped."""
+        text = str(value)
+        if reveal or not _is_secret_key(key):
+            return text
+        return _mask_secret(text)
+
+    def row(key: str, value: str) -> None:
+        """Add one row, rendering BOTH columns as literal text.
+
+        Every cell goes through :class:`rich.text.Text`, which is what makes
+        the rendered value byte-identical to the stored one. A bare ``str``
+        cell is parsed by ``rich`` as CONSOLE MARKUP, so a config value
+        containing a tag-shaped or ``:shortcode:`` payload renders as
+        something other than what is in the file::
+
+            stored    TOKSTART[bold]MIDDLE[/bold]ENDOFTOKENVALUE99   (44 chars)
+            rendered  TOKSTARTMIDDLEENDOFTOKENVALUE99                (31 chars)
+            stored    SECSTART:rocket:SECEND     rendered  SECSTART🚀SECEND
+
+        That is not a masking bypass — masking is applied to the raw string
+        before this point and holds either way — but ``--reveal`` exists for
+        exactly one purpose: to read a credential accurately enough to COPY
+        it. A silently shortened token gets pasted and fails later as an
+        opaque 401, far from the command that corrupted it, and the output
+        still looks like a credential so nothing prompts a second look.
+
+        Note the tool already contained its own detector and never consulted
+        it: the masked row's ``(44 chars)`` is computed on the raw string,
+        while the revealed row printed the 31-character stripped value. The
+        two views disagreed and nothing surfaced the disagreement. Wrapping
+        removes the disagreement rather than reporting it.
+
+        ``Text`` is used rather than ``markup=False`` on the console because
+        it is targeted: the table's ``header_style="bold"`` keeps working,
+        and only the data cells are made literal. It also disables emoji
+        substitution and the automatic highlighter for these cells, which are
+        the same class of "displayed != stored" defect.
+        """
+        table.add_row(Text(key), Text(value))
 
     console = Console()
     table = Table(show_header=True, header_style="bold")
     table.add_column("Key")
     table.add_column("Value")
 
-    apps_field_name = "apps"
+    nested_fields = {"apps", "test_devices"}
     for f in dc_fields(cfg):
-        if f.name == apps_field_name:
+        if f.name in nested_fields:
             continue
-        value = getattr(cfg, f.name)
-        table.add_row(f.name, str(value))
+        row(f.name, cell(f.name, getattr(cfg, f.name)))
+
+    # ``test_devices`` — both counts, then one row per device. The ids are
+    # config the operator authored (not credentials), so they render as-is;
+    # the PII contract that keeps raw ids off rendered surfaces applies to
+    # JOB output (``_render_roster``), not to the config inspector.
+    devices: list[TestDevice] = cfg.test_devices
+    if devices:
+        row(
+            "test_devices",
+            f"{len(devices)} devices, "
+            f"{sum(len(d.ids) for d in devices)} identifiers",
+        )
+        for i, device in enumerate(devices):
+            row(f"test_devices[{i}].name", device.name or "(unnamed)")
+            if device.platform:
+                row(f"test_devices[{i}].platform", device.platform)
+            for j, device_id in enumerate(device.ids):
+                row(f"test_devices[{i}].ids[{j}]", device_id)
+    else:
+        row("test_devices", "0 devices, 0 identifiers")
 
     # ``apps`` last — nested rows per app and per nested sub-table.
-    apps: list[dict[str, Any]] = getattr(cfg, apps_field_name)
+    apps: list[dict[str, Any]] = cfg.apps
     for i, app in enumerate(apps):
         for k, v in app.items():
             if isinstance(v, dict):
                 for sub_k, sub_v in v.items():
-                    table.add_row(f"apps[{i}].{k}.{sub_k}", str(sub_v))
+                    row(f"apps[{i}].{k}.{sub_k}", cell(sub_k, sub_v))
             else:
-                table.add_row(f"apps[{i}].{k}", str(v))
+                row(f"apps[{i}].{k}", cell(k, v))
 
     console.print(table)
 
@@ -2319,7 +2636,14 @@ def _render_config_table(cfg: AdingestConfig) -> None:
     default=None,
     help="Override cascade — show config for this slug instead of the active one.",
 )
-def config_show(project: str | None) -> None:
+@click.option(
+    "--reveal",
+    is_flag=True,
+    default=False,
+    help="Print secrets literally instead of masked. Copies credentials to "
+         "stdout/scrollback/transcripts — use only when you must.",
+)
+def config_show(project: str | None, reveal: bool) -> None:
     """Render the resolved caller config as a rich table.
 
     Resolves the active slug via the standard cascade (``--project`` →
@@ -2327,16 +2651,17 @@ def config_show(project: str | None) -> None:
     ``.env``, loads + interpolates ``config.toml``, and renders the
     resulting :class:`AdingestConfig` as a two-column rich Table.
 
-    Secrets are shown LITERAL (no redaction) per Open Question #2 — the
-    operator runs ``config show`` to debug and a mask would defeat the
-    purpose; secrets live at mode 0600 under ``~/.adingest/<slug>/.env``
-    and the operator is the sole viewer.
+    Secrets are MASKED by default — ``THAX…ZE8 (48 chars)`` — so the command
+    is safe to run in a shared terminal or an agent session. An unset secret
+    renders ``(unset)``, never a mask, so "not configured" can never be
+    misread as "configured but hidden". Pass ``--reveal`` to print literal
+    values; that flag is the ONLY way to disclose them.
     """
     home = ADINGEST_HOME
     slug = resolve_active_project(explicit=project, home=home)
     _source_project_env(slug, home=home)
     cfg = load_config(slug, home=home)
-    _render_config_table(cfg)
+    _render_config_table(cfg, reveal=reveal)
 
 
 if __name__ == "__main__":

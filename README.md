@@ -96,7 +96,16 @@ staging
 $ adingest init <slug>          # bootstrap a new project; sets active if no current active
 
 $ adingest config show          # render the resolved config for the active project
+$ adingest config show --reveal # ...with secrets printed literally (see below)
 ```
+
+`config show` **masks credential values by default** — `THAX…ZE8 (43 chars)` rather than the secret itself. The prefix/suffix and length are enough to answer the questions you actually run it for (did my edit land, is the value present, is it the one I think), without copying the credential into stdout, scrollback, a screen share, or an agent transcript. The file's `0600` mode protects the *file*; it does nothing for the channels this command writes to.
+
+- An **unset** secret renders `(unset)`, never a mask — "not configured" can never be misread as "configured but hidden".
+- Keys and structure are never hidden; only credential-shaped **values** are masked.
+- `--reveal` prints literal values. It is the only way to disclose them, and it is deliberately not coupled to any verbosity flag.
+
+What counts as a credential is the project-wide deny list in `src/ad_ingest/log_setup.py` (`DENY_FIELDS`) — the same classification that drives the service's log redactor, so the two cannot drift apart.
 
 A minimal per-project `config.toml`:
 
@@ -137,17 +146,32 @@ Test phones generate real ad impressions that pollute production revenue — a Q
 
 Add an `[[exclusions.test_devices]]` array to a `config.toml`. The global file (`~/.adingest/config.toml`) is the recommended home so every project inherits one roster:
 
+**One entry per physical device**, with every identifier that device has minted in an `ids` array:
+
 ```toml
 [[exclusions.test_devices]]
-name = "Dominic Galaxy S23"            # recommended — an operator label; shown in the roster, never sent to the service (omit it and the device still filters, rendered as "(unnamed)")
-id   = "495d5f3e-0000-4a1b-9c2d-1234"  # required — the device's advertising ID (idfa on iOS, GAID on Android)
+name     = "Dominic Galaxy S23"   # recommended — an operator label; shown in the roster, never sent to the service (omit it and the device still filters, rendered as "(unnamed)")
+platform = "android"              # optional, documentation only — never sent, never matched
+ids = [                           # required — the device's advertising IDs (idfa/idfv on iOS, GAID on Android)
+  "495d5f3e-0000-4a1b-9c2d-1234",   # GAID — device-level
+]
 
 [[exclusions.test_devices]]
-name = "QA iPhone 14"
-id   = "8f14e45f-ceea-467a-9f1b-5678"
+name     = "QA iPhone 14"
+platform = "ios"
+ids = [
+  "8f14e45f-ceea-467a-9f1b-5678",   # IDFA — device-level
+  "47d3c04d-b877-4542-bd95-3273",   # IDFV — 07-01..07-21
+  "f783217a-c032-40ca-bbca-fef0",   # IDFV — concurrent with the above
+]
 ```
 
-- **What crosses the wire.** Only `id` is sent — flattened onto the `test_device_ids` wire field. `name` stays caller-side and is used solely for the by-name roster the CLI prints when rows are dropped. A raw advertising ID never appears in any rendered output (counts and operator-authored names only).
+- **Why an array, not one entry per ID.** A phone mints a **new IDFV per install** — one handset produced three in ~3 weeks, two of them running concurrently. With one entry per identifier, that phone occupied three sibling rows and the entry count read as a device count on the roster that decides what is excluded from revenue. Per-element comments (valid TOML in a multi-line array) also give *why this ID exists* a home next to the ID.
+- **The scalar `id` is not accepted.** An entry carrying `id = "..."` is a hard error whose message names the key and its replacement. A one-element `ids` array already *is* the single-identifier case, so a second accepted spelling would buy a transient migration at the cost of permanent complexity — two ways to say one thing is the shape that drifts.
+- **⚠ CLI and `config.toml` are a PAIRED update, per host.** The break is symmetric: a new CLI reading an old `id` config hard-errors on the missing `ids`, and an old CLI reading a new `ids` config hard-errors on the missing `id`. No upgrade ordering avoids a window, so update the CLI and the config **together, as one step**, on every host that can fire — the config files are host-specific and are not synced (`sync-creds-to-genesis.sh` carries `.env` only). Do it inside the gap between daily fires.
+- **Missing identifiers fail loud.** An entry with no `ids`, an empty `ids` array, a non-array `ids`, or a blank element is a hard error naming the entry. A roster entry that silently excludes nothing is the failure mode this feature exists to prevent.
+- **What crosses the wire.** Only the identifiers are sent — flattened onto the `test_device_ids` wire field, which is and stays a **flat list of strings**. The per-device nesting is caller-side only, so it required no API change. `name` / `platform` stay caller-side; `name` feeds the roster the CLI prints when rows are dropped. A raw advertising ID never appears in any rendered job output (counts and operator-authored names only).
+- **The roster names both counts** — `Test-device exclusions (2 devices, 5 identifiers): …`. They answer different questions (whose traffic is excluded vs. how many install generations are covered), so both are always stated.
 - **Matching is case-insensitive.** Each configured `id` is normalized (`.strip().lower()`) and compared against each row's `idfa` / `idfv`, lower-cased at the engine seam — so a mixed-case (or space-padded) config value still matches. A row carrying no `idfa` / `idfv` is simply never a match.
 - **The all-zeros ID is rejected.** `00000000-0000-0000-0000-000000000000` is the platform opt-out sentinel — the ID reported for a user who disabled ad tracking (**Android 12+ / iOS 14.5+** behavior; it is *not* a universal "null device" across all platforms). Configuring it returns `422 test-device-id-invalid` rather than silently excluding every opted-out user.
 - **Per-slug overrides — it does not extend.** A per-project `[[exclusions.test_devices]]` block **replaces** the global roster wholesale for that slug (config arrays merge by replacement, never union). If a slug's `skipped_test` unexpectedly drops to 0, check whether a per-slug `[exclusions]` block silently shadowed the global list.
