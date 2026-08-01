@@ -6,7 +6,7 @@ Single-file CLI for the [ad-ingest](https://api.creational.ai/adingest) service.
 * `adingest range 2026-05-10..2026-05-12 --poll` — backfill loop, one job per day
 * `adingest status <JOB_ID>` — re-render the table for an existing job
 * `adingest upgrade` — atomic self-replace via service manifest + sha256-verified bytes from this mirror
-* `adingest fetch-only 2026-05-12 --json` — pipeable canonical revenue rows on stdout, **zero writes** (no BQ, no GA4, no dedup); validate a caller's config with no destination credentials
+* `adingest fetch-only 2026-05-12 --json` — pipeable canonical revenue rows on stdout, **zero writes** (no BQ, no GA4, no dedup); validate a caller's config without provisioning a destination (a project declaring `[ga4_export]` sends one **read-only** BQ credential and pays for one export read — still zero writes)
 * `[[exclusions.test_devices]]` config — drop known test-phone REVENUE rows before BQ + GA4, counted per source as `skipped_test` (observable, never silent)
 * 9-category verdict classifier (`✅ healthy-fresh`, `🚨 silent-drop`, `✅ fetch-only`, …) — one-glance health per source and per app-platform rollup
 * PEP 723 single-file Python script — [uv](https://docs.astral.sh/uv/) resolves inline deps on first run; no `pip install`, no virtualenv
@@ -182,6 +182,43 @@ ids = [
 - **Not a GA4 / BQ history cleaner.** Same point from the destination side — already-landed test revenue stays until you delete it out-of-band.
 - **Perishable IDs, so watch the counter.** Advertising IDs rotate (a factory reset, an OS-level advertising-ID reset, an app reinstall). A stale ID silently stops matching and that device's traffic quietly rejoins production. `skipped_test` reading 0 — or the by-name roster disappearing on a day you know a test device was active — is the signal to refresh the IDs. The feature fails open by design.
 
+### Store attribution (Google Play vs Amazon Appstore)
+
+One Android app shipped to two stores arrives from the mediation network as a single stream — the store is not on the row. Declare a `[ga4_export]` block plus a per-app `store_routes` array and the service resolves each user's store from **your own GA4 BigQuery export**, writes it to `segment` on the revenue row, and routes the GA4 fan-out to the matching stream.
+
+```toml
+[ga4_export]                                  # your GA4 BigQuery export — a READ oracle, not an ingest source
+project_id   = "hexario-29339684"
+dataset      = "analytics_152569219"
+lookback_days = 30                            # optional (default 30)
+
+[[apps]]
+app_id   = "com.mochibits.hexario.google"     # unchanged — still the Play package, still the dedup key
+platform = "android"
+ga4      = { firebase_app_id = "1:812…:android:84cf…", api_secret = "${GA4_API_SECRET}" }
+
+  [[apps.store_routes]]                       # the DEFAULT-PACKAGE route is required
+  app_info_id = "com.mochibits.hexario.google"
+  segment     = "google"
+
+  [[apps.store_routes]]
+  app_info_id = "com.mochibits.hexario.amazon"
+  segment     = "amazon"
+  [apps.store_routes.ga4]                     # optional per-store stream override
+  firebase_app_id = "1:812…:android:a3a2…"
+  api_secret      = "${GA4_API_SECRET_AMAZON}"
+```
+
+- **`app_info_id` is the package name your app reports to GA4**; `segment` is the short token written to the revenue row. They are different key spaces — the route is the map between them.
+- **Opt-in is per app, and an app that declares no `store_routes` is untouched.** An iOS `[[apps]]` entry with no routes keeps `segment` empty and fans out exactly as before. This is deliberate: a request-level rule would silently stop the entire iOS fan-out.
+- **A route covering the app's own `app_id` is required.** Omit it and every Play row would resolve to nothing, which the service treats as unroutable — so the config is rejected with a `422` naming both the `app_id` and the routes you did declare.
+- **`store_routes` requires `[ga4_export]`.** Declaring routes with no export block is a `422`, not a silent no-op — without the export there is nothing to resolve against, and the half-configured state would suppress that app's whole fan-out while the counters read clean.
+- **Both surfaces are per-project, never global.** Config arrays **replace** rather than append, so a `store_routes` written into `~/.adingest/config.toml` is shadowed wholesale the moment a project declares its own `[[apps]]` — the same footgun as the test-device roster, in the opposite direction.
+- **`config show` masks both new secrets** — `ga4_export.sa_key` and every `store_routes[].ga4.api_secret` — and never prints the inside of a key file.
+- **`fetch-only` is the rehearsal.** With the complete route block in place it exercises resolution and reports the per-store split while writing nothing and sending nothing. It is also the one surface where the credential cost applies — see [`adingest fetch-only`](#adingest-fetch-only).
+
+> `segment` sits **outside** the dedup key on purpose, and `app_id` never changes. Turning this on re-labels rows; it cannot double-insert them.
+
 ## `adingest ingest`
 
 POST one ingest for a single `EVENT_DATE` (ISO date, `YYYY-MM-DD`). Returns immediately with a `job_id`; pass `--poll` to wait until terminal and render the table.
@@ -205,6 +242,8 @@ GA4: attempted=0  sent=0  skipped_orphan=0  failed=0
 ```
 
 > Re-running the same `event_date` is always safe. The service's per-source dedup tuple turns the second call into a `✅ healthy-dedup` no-op.
+
+> **`Store:` line.** A source whose apps declare `store_routes` renders one extra line under `GA4:` — `Store: google=900  amazon=100  unresolved=12 (0.01% of lookup scope, warn>5.00%)  multi_pkg=0  unknown_pkg=0  store-unresolved=12`. A source that did **not** run store resolution renders no such line at all (the counters are present-and-zero on every response; the line is gated on the state, not on key presence). `unresolved`'s percentage excludes rows with no `user_id` — they were never eligible for a label — and renders `—` when that denominator is zero. **`unknown_pkg` is a *config* alarm, not a data one**: it counts rows whose resolved package matches no declared `store_routes[].app_info_id` (a typo, or a genuinely new store), and those rows are suppressed from GA4 permanently while `unresolved` does not move. `store-unresolved` is how many GA4 events that suppression skipped; `fetch-only` omits it, since it never publishes.
 
 | Flag | Behavior |
 |------|----------|
@@ -264,7 +303,9 @@ GA4: attempted=955  sent=949  skipped_orphan=6  failed=0
 
 ## `adingest fetch-only`
 
-Run the same faithful pipe as `ingest` — adapter fetch → validation → match remap — but **stop before the sinks**: no BigQuery write, no GA4 fan-out, no dedup query. The day's canonical revenue rows come back as pipeable JSON on stdout; counters and verdicts go to stderr. Two operator wins: pull a day of rows without provisioning any destination, and validate a caller's config (LP creds, per-app `match` remap, row validity) end-to-end with **zero writes and zero destination credentials**.
+Run the same faithful pipe as `ingest` — adapter fetch → validation → match remap — but **stop before the sinks**: no BigQuery write, no GA4 fan-out, no dedup query. The day's canonical revenue rows come back as pipeable JSON on stdout; counters and verdicts go to stderr. Two operator wins: pull a day of rows without provisioning any destination, and validate a caller's config (LP creds, per-app `match` remap, row validity) end-to-end with **zero writes**.
+
+> **⚠ The zero-credential half of that claim no longer holds for every caller — the zero-write half still holds for all of them.** A project declaring [`[ga4_export]`](#store-attribution-google-play-vs-amazon-appstore) sends **one read-only BigQuery SA key** in the request body (there is no `destinations` block for the service to read it from) and the run issues **one billed export read**. So a store-routed `fetch-only` is neither credential-free nor free. It still writes nothing and sends nothing — no BQ insert, no dedup query, no GA4 event — which is why it stays the safe way to rehearse a config. A project with no `[ga4_export]` block is unchanged in every respect.
 
 It **always polls** (rows only exist at the terminal job, so a fire-and-forget fetch-only is meaningless) — there is no `--poll` flag.
 
@@ -359,12 +400,14 @@ Each source gets exactly one verdict per job, plus per-`(platform, app_id)` verd
 | 🚨 | `invalid-heavy` | `rows_invalid` is a significant fraction of `rows_fetched` (adapter-drop heavy) |
 | 🚨 | `writer-orphan-heavy` | `rows_inserted_orphan` is a significant fraction of `rows_inserted` (BQ landed but no `user_id`) |
 | 🚨 | `ga4-orphan-heavy` | `ga4_events_skipped_orphan` is a significant fraction of `ga4_events_attempted` |
-| 🚨 | `silent-drop` | Counter-balance violation — `rows_fetched != rows_invalid + rows_skipped_test_device + rows_skipped_dedup + rows_inserted`. Means a row vanished between fetch and BQ without classification. |
+| 🚨 | `silent-drop` | **Either of two unrelated causes.** (a) Counter-balance violation — `rows_fetched != rows_invalid + rows_skipped_test_device + rows_skipped_dedup + rows_inserted`. Means a row vanished between fetch and BQ without classification. (b) `store_resolution_state == "failed"` — the GA4-export store resolver failed, so the source wrote **nothing** and sent **nothing** (fail-closed), and the date is **re-runnable**. Tell them apart from the `Store:` line and the `errors[]` entry: cause (b) carries `https://api.creational.ai/errors/store-resolution-failed`. |
 | ✅ | `fetch-only` | A `fetch-only` job that fired neither `empty-upstream` nor `invalid-heavy` — the healthy fetch-only outcome: rows fetched and valid, nothing written by design. |
 
 > The tier emoji (`✅` / `⚠️` / `🚨`) is render-only — it shows in the table output. The JSON `verdicts` field carries just the bare name (e.g. `["healthy-fresh"]`).
 
-> **fetch-only mode.** On a `fetch-only` job only the two *pre-sink* triggers evaluate — `empty-upstream` and `invalid-heavy` (both computed from `rows_fetched` / `rows_invalid`, which fetch-only populates for real). The sink-boundary triggers (`healthy-fresh`, `healthy-dedup`, `partial-dedup`, `writer-orphan-heavy`, `ga4-orphan-heavy`, `silent-drop`) are suppressed — they are meaningless with no writer or publisher, and `silent-drop` in particular would false-positive on *every* successful fetch-only run (`rows_inserted == 0` by construction). When neither pre-sink trigger fires, the verdict is `fetch-only` ✅; when a caller's match rules drop rows the operator still sees `invalid-heavy` (Use Case 2's broken-config signal). The `fetch-only` slug deliberately breaks the `healthy-*` naming pattern — verb↔wire↔verdict name parity wins.
+> **fetch-only mode.** On a `fetch-only` job the *pre-sink* triggers evaluate — `empty-upstream` and `invalid-heavy` (both computed from `rows_fetched` / `rows_invalid`, which fetch-only populates for real), plus `silent-drop`'s **state-driven limb** (see below). The sink-boundary triggers (`healthy-fresh`, `healthy-dedup`, `partial-dedup`, `writer-orphan-heavy`, `ga4-orphan-heavy`) are suppressed — they are meaningless with no writer or publisher. When no trigger fires, the verdict is `fetch-only` ✅; when a caller's match rules drop rows the operator still sees `invalid-heavy` (Use Case 2's broken-config signal). The `fetch-only` slug deliberately breaks the `healthy-*` naming pattern — verb↔wire↔verdict name parity wins.
+>
+> ⚠ **`silent-drop`'s two limbs behave differently in fetch-only mode, and the split is deliberate.** The **arithmetic** limb (cause (a) above) stays **suppressed**: it would false-positive on *every* successful fetch-only run, since `rows_inserted == 0` by construction. The **state-driven** limb (cause (b), `store_resolution_state == "failed"`) **evaluates in both modes**, because the store resolver runs *pre*-sink — including on the fetch-only path. Without it a fail-closed run renders a green `✅ fetch-only` while having produced nothing, on the exact rehearsal the store rollout depends on.
 
 `--json` emits the same verdicts under `sources[<src>].verdicts: [...]` and `sources[<src>].by_app_platform[<key>].verdicts: [...]`. Pipe into `jq` for cron alerting — anything not in the healthy set is an alert:
 

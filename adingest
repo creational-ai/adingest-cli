@@ -43,7 +43,7 @@ from rich.text import Text
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -197,10 +197,25 @@ class AdingestConfig:
 
     Step 9 of core-cli-config-refactor: the legacy ``from_env`` classmethod and
     the cwd-coupled ``_load_env_client`` loader were removed in favor of the
-    TOML-backed ``load_config(slug)`` pipeline (Step 3). The dataclass shape is
-    unchanged — same nine fields (``test_devices`` added by
-    core-test-device-exclusion), same defaults, still frozen — but the
-    construction surface is now the loader, not env-var scraping.
+    TOML-backed ``load_config(slug)`` pipeline (Step 3); the construction
+    surface is the loader, not env-var scraping.
+
+    Field count is NOT an invariant — an earlier revision of this docstring
+    asserted "the dataclass shape is unchanged — same nine fields", which a
+    tenth field falsified. ``ga4_export`` (core-ga4-store-attribution Step 2)
+    is the tenth: an OPAQUE, already-``${VAR}``-interpolated passthrough of the
+    per-caller ``[ga4_export]`` TOML block, exactly like ``apps``. The CLI does
+    not know or validate its schema; the service's ``GA4ExportSource`` model
+    does, so a newer service field needs no CLI change.
+
+    Per-app ``store_routes`` needs no field at all — it rides inside ``apps``,
+    which is already an opaque passthrough.
+
+    ⚠ Both new surfaces are **per-slug config only**. ``_deep_merge`` REPLACES
+    arrays rather than appending, so a ``store_routes`` (or an ``[[apps]]``
+    block) declared in the global ``~/.adingest/config.toml`` is shadowed
+    wholesale the moment a slug declares its own — the same footgun as the
+    test-device roster, in the opposite direction.
     """
     url: str = "http://localhost:8000"
     token: str = ""
@@ -211,6 +226,7 @@ class AdingestConfig:
     bq_dataset: str = ""
     bq_sa_key_path: str = ""
     test_devices: list[TestDevice] = field(default_factory=list)
+    ga4_export: dict[str, Any] = field(default_factory=dict)
 
 
 # --- TOML config loader (~/.adingest/<slug>/) ------------------------------
@@ -495,6 +511,7 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
         [bq].sa_key_path                  bq_sa_key_path  (expanduser applied)
         [[apps]]                          apps            (list pass-through)
         [[exclusions.test_devices]]       test_devices    (parsed → TestDevice)
+        [ga4_export]                      ga4_export      (dict pass-through)
 
     Path-typed fields: only ``bq_sa_key_path`` today. ``${VAR}`` interpolation
     happens BEFORE this step; ``~``-expansion happens AFTER, so a
@@ -518,7 +535,21 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
     nested ``ga4`` sub-dict (``app["ga4"] = {"measurement_id": ..., "api_secret": ...}``)
     as produced by ``tomllib``. The dataclass field type is
     ``list[dict[str, Any]]``; downstream consumers (``AdingestClient._build_body``)
-    treat each app as an opaque dict per the wire contract.
+    treat each app as an opaque dict per the wire contract. That opacity is
+    what lets a per-app ``store_routes`` array (core-ga4-store-attribution)
+    reach the wire with **no loader change at all** — the nested route dicts,
+    including each route's own ``ga4`` sub-table, survive verbatim.
+
+    ``[ga4_export]`` is the same deal one level up: a whole-block passthrough
+    into ``ga4_export``, absent → ``{}``. The CLI never inspects its keys; the
+    service's ``GA4ExportSource`` model owns the schema, so a field added there
+    ships without touching this file.
+
+    ⚠ **Both new surfaces are per-slug only.** ``_deep_merge`` REPLACES arrays
+    wholesale (D14) rather than appending, so a ``store_routes`` authored in
+    the global ``~/.adingest/config.toml`` is silently shadowed the moment a
+    slug declares its own ``[[apps]]`` block. Author them in the per-caller
+    file, next to the app they route.
 
     Examples::
 
@@ -536,6 +567,7 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
     apps = merged.get("apps") or []
     exclusions = merged.get("exclusions") or {}
     test_devices = _parse_test_devices(exclusions.get("test_devices") or [])
+    ga4_export = merged.get("ga4_export") or {}
 
     bq_sa_key_path_raw = bq.get("sa_key_path", "")
     bq_sa_key_path = (
@@ -552,6 +584,7 @@ def _to_adingest_config(merged: dict[str, Any]) -> AdingestConfig:
         bq_dataset=bq.get("dataset", ""),
         bq_sa_key_path=bq_sa_key_path,
         test_devices=test_devices,
+        ga4_export=dict(ga4_export),
     )
 
 
@@ -1052,10 +1085,20 @@ class AdingestClient:
         """POST a ``fetch_only=true`` ingest — no ``destinations`` block, zero writes.
 
         The body carries the same sources/creds + apps/match config as a normal
-        ingest but sets ``fetch_only: true`` and omits ``destinations`` entirely,
-        so no BQ SA key is read and no destination creds are required (the
-        zero-cred validation win). The service runs the identical adapter fetch →
-        validation → match-remap path and stops before every sink.
+        ingest but sets ``fetch_only: true`` and omits ``destinations``
+        entirely. The service runs the identical adapter fetch → validation →
+        match-remap path and stops before every sink.
+
+        ⚠ **The zero-credential claim is AMENDED, the zero-write one is not.**
+        A caller declaring ``[ga4_export]`` (core-ga4-store-attribution) sends
+        ONE read-only BigQuery SA key in the body — inlined by
+        ``_build_fetch_only_body``, because with no ``destinations`` block
+        there is nothing for the service to fall back to — and the run issues
+        one billed export read. So fetch-only is no longer zero-credential and
+        no longer free for such a caller. It still **writes nothing and sends
+        nothing**: no BQ insert, no dedup query, no GA4 event. That half is
+        what puts fetch-only in CLAUDE.md's safe column, and it is unchanged.
+        Callers with no ``[ga4_export]`` block are byte-identical to before.
         """
         return self._request(
             "POST", "/v1/", json=self._build_fetch_only_body(event_date, source, apps)
@@ -1133,6 +1176,12 @@ class AdingestClient:
         }
         if self.config.test_devices:
             body["test_device_ids"] = _flatten_device_ids(self.config.test_devices)
+        if self.config.ga4_export:
+            # Passthrough, NO ``sa_key`` inlining: on the ingest path the
+            # service falls back to ``destinations.bigquery.sa_key``, which
+            # this body already carries. Inlining would duplicate a credential
+            # in one request body for no benefit.
+            body["ga4_export"] = dict(self.config.ga4_export)
         return body
 
     def _build_fetch_only_body(
@@ -1140,10 +1189,30 @@ class AdingestClient:
     ) -> dict[str, Any]:
         """Build the fetch-only request body: ``fetch_only: true``, NO ``destinations``.
 
-        Omitting ``destinations`` is the zero-cred contract — no BQ SA key is
-        read (``_build_body`` reads it; this path never touches it). The server's
-        ``check_destinations_present`` validator accepts a missing
-        ``destinations`` iff ``fetch_only`` is true.
+        Omitting ``destinations`` is what the server's
+        ``check_destinations_present`` validator accepts iff ``fetch_only`` is
+        true, and it is why nothing this body triggers can write.
+
+        ⚠ **The zero-credential contract is EXPLICITLY AMENDED here.** It used
+        to be exactly true: ``_build_body`` reads the BQ SA key, this path
+        never touched it. It no longer is. A caller declaring ``[ga4_export]``
+        gets that key **inlined into the export block** — precisely because
+        there is no ``destinations`` block for the service to fall back to — so
+        a store-routed fetch-only run carries one **read-only** BigQuery
+        credential and issues one billed export read.
+
+        *Writes nothing* survives unchanged: no BQ insert, no dedup query, no
+        GA4 event. That is the half CLAUDE.md's safe-command table rests on.
+
+        🔴 ``sa_key`` is OMITTED ENTIRELY when the configured key file is unset
+        or missing — never ``"sa_key": {}``. ``_build_body``'s ``sa_key = {}``
+        fallback is deliberately NOT copied here: an empty dict is not
+        ``None``, so under an ``is None`` reading of the service's
+        ``check_ga4_export_credential_present`` it sails past the designed 422
+        and instead fails closed mid-run, holding a whole day across every
+        platform. The service hardens the same gap from its side (the
+        validator's predicate is falsiness, not identity); both halves land,
+        because either alone leaves the gap open on the other side of the wire.
         """
         body: dict[str, Any] = {
             "event_date": event_date,
@@ -1153,6 +1222,15 @@ class AdingestClient:
         }
         if self.config.test_devices:
             body["test_device_ids"] = _flatten_device_ids(self.config.test_devices)
+        if self.config.ga4_export:
+            export: dict[str, Any] = dict(self.config.ga4_export)
+            key_path = self.config.bq_sa_key_path
+            if key_path and Path(key_path).exists():
+                export["sa_key"] = json.loads(Path(key_path).read_text())
+            if not export.get("sa_key"):
+                # Never emit a falsy ``sa_key`` — absence is the 422 signal.
+                export.pop("sa_key", None)
+            body["ga4_export"] = export
         return body
 
 
@@ -1185,6 +1263,21 @@ class VerdictClassifier:
     def classify(cls, source: dict[str, Any], fetch_only: bool = False) -> list[str]:
         f = int(source.get("rows_fetched", 0))
         inv = int(source.get("rows_invalid", 0))
+        # Store-resolution state, read defensively: a response from a service
+        # build predating the labeling slice carries no such key and must
+        # classify exactly as it does today, hence the ``"disabled"`` default.
+        #
+        # 🔴 This is the ONE trigger that is NOT sink-boundary and therefore
+        # the one trigger that must evaluate in BOTH modes. The resolver runs
+        # PRE-sink (before the writer, and on the fetch-only path too), so a
+        # fail-closed source has honest counters — rows fetched, nothing
+        # invalid — and the fetch-only branch below would otherwise render a
+        # green ``✅ fetch-only`` for a run that wrote and sent nothing. That
+        # false green would land on the safety rehearsal for the highest-
+        # blast-radius change in the feature, on the path most likely to hit
+        # it. It reuses ``silent-drop`` (index 7) rather than adding a tenth
+        # tier: ``VERDICTS`` stays index-stable and no consumer changes.
+        store_failed = str(source.get("store_resolution_state", "disabled")) == "failed"
         if fetch_only:
             # Mode-aware: a fetch-only job NEVER touches the writer / dedup / GA4,
             # so only the two PRE-SINK conditions can fire — ``empty-upstream``
@@ -1199,6 +1292,13 @@ class VerdictClassifier:
                 fo.append(3)  # empty-upstream 🚨 (guarded on f==0; inv can't co-fire)
             if f > 0 and inv > 0.05 * f:
                 fo.append(4)  # invalid-heavy 🚨
+            if store_failed:
+                fo.append(7)  # silent-drop 🚨 (store resolver failed pre-sink)
+            # 🔴 The ``fetch-only`` default MUST stay last. Appended before the
+            # store trigger, a failed run renders ``["silent-drop",
+            # "fetch-only"]`` — a 🚨 and a ✅ "healthy" slug on the same run,
+            # both injected verbatim into the archived ``--json`` body by
+            # ``_merge_verdicts_into_response``.
             if not fo:
                 fo.append(8)  # fetch-only ✅ (healthy: rows fetched, invalid within tolerance)
             fo.sort(key=lambda t: (cls.TIER_RANK[cls.VERDICTS[t][1]], t))
@@ -1235,6 +1335,13 @@ class VerdictClassifier:
             triggers.append(6)
         if i < (f - inv - x - d):
             triggers.append(7)
+        # 🔴 De-duplicated, not appended blind. The fail-closed shape is
+        # honest ``f > 0, i = 0, d = 0``, which already satisfies the
+        # arithmetic trigger above — a second append yields
+        # ``["silent-drop", "silent-drop"]``, and the existing tests assert
+        # exact list equality.
+        if store_failed and 7 not in triggers:
+            triggers.append(7)
         triggers.sort(key=lambda t: (cls.TIER_RANK[cls.VERDICTS[t][1]], t))
         return [cls.VERDICTS[t][0] for t in triggers]
 
@@ -1258,6 +1365,15 @@ def _per_app_counters(source: dict[str, Any], app: dict[str, Any]) -> dict[str, 
     ``silent-drop`` (``i < f - inv - d``) fires falsely on every app of a multi-app
     source — the source total is charged against one app's rows. (Single-app sources
     masked this: source-fetched == that app's fetched.)
+
+    ⚠ The returned dict is an EXPLICIT key list, not a filtered copy — so the
+    store labeling slice is absent from it by construction, and
+    ``classify(..., store_resolution_state)`` therefore never fires at app
+    scope. That is correct today: store resolution is a source-scope act
+    (one export query per source), and the engine's ``by_app_platform`` rollup
+    carries no store breakdown to attribute. **Any future per-app store
+    verdict needs a matching edit HERE** — adding the key upstream alone is
+    silently dropped at this boundary.
 
     Scope-correct model: per-app ``rows_fetched`` is the rows that MATCHED this app =
     ``rows_inserted + rows_skipped_dedup`` (orphan is a subset of inserted, not
@@ -1290,6 +1406,91 @@ def _format_uid_pct(inserted: int, orphan: int) -> str:
     if orphan > inserted:
         return "ERR"
     return f"{((inserted - orphan) / inserted) * 100:.1f}%"
+
+
+#: The unresolved-rate level at which the store split reads as a problem. Not
+#: a fail-closed threshold — that is ``ga4_export.unresolved_ceiling`` (0.5),
+#: enforced service-side on BOTH limbs. This is the human "look at this" mark
+#: the design calibrated on the row-limb ratio below.
+_STORE_UNRESOLVED_WARN_PCT = 5.0
+
+
+def _store_enabled(source: dict[str, Any]) -> bool:
+    """True when this source actually ran store resolution.
+
+    The labeling slice is written onto EVERY source of EVERY response (the
+    counter model has no "absent" state), so the realistic default is *keys
+    present, all zero, state ``"disabled"``*. Gating the split line on the
+    state — not on key presence, and not on a non-zero counter — is what keeps
+    every non-opted-in source (all of iOS, every caller that has not declared
+    ``store_routes``) rendering byte-identically to before this feature.
+    """
+    return str(source.get("store_resolution_state", "disabled")) != "disabled"
+
+
+def _format_store_unresolved_pct(source: dict[str, Any]) -> str:
+    """Render the unresolved rate over the LOOKUP scope, or ``—``.
+
+    🔴 The denominator is ``rows_store_in_scope - rows_store_no_user_id``, NOT
+    ``rows_store_in_scope``. Rows with a falsy ``user_id`` were never eligible
+    for a label — no lookup was ever issued for them — so counting them as
+    failures inflates the ratio (~14% relative on a measured android day:
+    14,737 null-user rows of 124,267 in scope) and de-calibrates the one
+    number the daily review is meant to read. It is also the ratio the 5% warn
+    and the service-side ``unresolved_ceiling`` were both calibrated on.
+
+    ``—`` on a zero (or negative, on a malformed body) denominator, mirroring
+    :func:`_format_uid_pct`'s convention — reachable in production on a day
+    whose in-scope rows all carry a falsy ``user_id``, where the alternative
+    is a live ``ZeroDivisionError`` on the interactive path.
+
+    ⚠ **Two decimals, deliberately diverging from :func:`_format_uid_pct`'s
+    one.** They report opposite ends of the scale: ``%uid`` lives near 99% and
+    one decimal is ample, while this rate's measured baseline is **0–0.50%**
+    and the rehearsal gate is drawn at 0.50%. At ``.1f`` the live 0.011% day
+    renders ``0.0%`` — indistinguishable from "nothing unresolved" — and
+    0.45% vs 0.54% both render ``0.5%``, straddling the gate. The number
+    exists to be compared against that bound, so it has to resolve it.
+    """
+    denom = int(source.get("rows_store_in_scope", 0)) - int(
+        source.get("rows_store_no_user_id", 0)
+    )
+    if denom <= 0:
+        return "—"
+    return f"{(int(source.get('rows_store_unresolved', 0)) / denom) * 100:.2f}%"
+
+
+def _format_store_split(source: dict[str, Any]) -> Text:
+    """Render the LABELING half of the store split — shared by both renderers.
+
+    Deliberately carries no GA4-derived figure: ``_render_fetch_only_source``
+    prints this verbatim, and fetch-only never publishes, so any suppression
+    count there would be a structural zero reading as "nothing was suppressed"
+    when suppression was never evaluated. The ingest renderer appends the
+    ``store-unresolved`` orphan count itself.
+
+    ``unknown_pkg`` earns its own field rather than sharing the unresolved
+    one: an unrouted package leaves ``rows_store_unresolved`` **unmoved**, so
+    a typo in a single ``store_routes[].app_info_id`` suppresses every
+    affected row from GA4 — permanently and unbackfillably — while the
+    unresolved rate does not budge and neither ceiling limb fires. Different
+    cause, different operator response, different field.
+
+    Returns a rich :class:`Text`, not a markup string: ``by_segment``'s keys
+    are hand-typed operator config (``store_routes[].segment``), and a token
+    containing brackets would otherwise be swallowed as console markup —
+    the same reasoning as the test-device roster.
+    """
+    by_segment = source.get("by_segment") or {}
+    seg = "  ".join(f"{k}={v}" for k, v in sorted(by_segment.items())) or "—"
+    return Text(
+        f"Store: {seg}  "
+        f"unresolved={source.get('rows_store_unresolved', 0)} "
+        f"({_format_store_unresolved_pct(source)} of lookup scope, "
+        f"warn>{_STORE_UNRESOLVED_WARN_PCT:.2f}%)  "
+        f"multi_pkg={source.get('rows_store_multi_package', 0)}  "
+        f"unknown_pkg={source.get('rows_store_unknown_package', 0)}"
+    )
 
 
 class TableRenderer:
@@ -1354,6 +1555,25 @@ class TableRenderer:
             f"skipped_orphan={source.get('ga4_events_skipped_orphan', 0)}  "
             f"failed={source.get('ga4_events_failed', 0)}"
         )
+        if _store_enabled(source):
+            # The suppression count is printed SEPARATELY from
+            # ``skipped_orphan`` above because ``ga4-orphan-heavy`` 🚨 now has
+            # two unrelated causes (a missing ``user_pseudo_id`` vs. an
+            # unresolved store) with different operator responses, and the
+            # lumped total no longer identifies which fired.
+            #
+            # 🔴 Read from the COUNTER, never by parsing ``errors[]``: this
+            # method receives only the per-source counter dict — ``render``
+            # consumes ``response["errors"]`` separately — so reaching for the
+            # error list here is not merely discouraged, it is impossible
+            # without widening the signature.
+            self.console.print(
+                _format_store_split(source)
+                + Text(
+                    "  store-unresolved="
+                    f"{source.get('ga4_events_skipped_store_unresolved', 0)}"
+                )
+            )
 
     def render_fetch_only(
         self, response: dict[str, Any], devices: list[TestDevice] | None = None
@@ -1407,6 +1627,21 @@ class TableRenderer:
         for (platform, app_id), count in sorted(breakdown.items()):
             table.add_row(platform, app_id, str(count))
         self.console.print(table)
+        if _store_enabled(source):
+            # The labeling split matters MORE here than on the ingest path:
+            # ``adingest fetch-only`` with the full target config is the
+            # zero-blast-radius rehearsal the whole rollout rests on, and
+            # these four numbers — the segment split, the unresolved rate,
+            # ``multi_pkg`` and ``unknown_pkg`` — are the gate that decides
+            # whether the daily gets switched on.
+            #
+            # ⚠ ``_format_store_split`` carries NO GA4-derived figure, and
+            # nothing is appended to it here. Fetch-only never publishes, so
+            # ``ga4_events_skipped_store_unresolved`` is a structural zero on
+            # this path; printing it would read as "no rows were suppressed"
+            # when suppression was never evaluated — the same misleading zero
+            # this renderer omits the whole ``GA4:`` line to avoid.
+            self.console.print(_format_store_split(source))
 
     def _maybe_render_roster(
         self, response: dict[str, Any], devices: list[TestDevice] | None
@@ -2041,8 +2276,12 @@ def fetch_only(
 
     Runs the identical adapter fetch → validation → match-remap path as
     ``ingest`` but STOPS before every sink (no BQ write, no dedup query, no GA4
-    fan-out), returning the day's canonical revenue rows. Requires only source
-    creds + a bearer — no destination credentials.
+    fan-out), returning the day's canonical revenue rows.
+
+    Requires source creds + a bearer. If this project declares a
+    ``[ga4_export]`` block, the request additionally carries one READ-ONLY
+    BigQuery SA key and the run issues one billed export read — still zero
+    writes, zero GA4 events.
 
     Always polls to a terminal state (no ``--poll`` flag). With ``--json``, the
     bare rows array lands on STDOUT (pipeable into ``jq``/files) and the counters
@@ -2534,6 +2773,26 @@ def _render_config_table(cfg: AdingestConfig, reveal: bool = False) -> None:
     ``N devices, M identifiers`` summary followed by per-device rows — the
     entry count alone is what previously read as a device count.
 
+    Nesting is walked to ARBITRARY depth by :func:`walk` below, not one level.
+    Two rules make that safe, and both are load-bearing rather than stylistic
+    (core-ga4-store-attribution Step 2):
+
+    * **A nested container renders as leaf rows, never also as a summary
+      row.** The nested rows REPLACE the generic single-row render; they never
+      supplement it. A ``store_routes`` list or a ``ga4_export`` dict emitted
+      as one stringified cell would print every ``api_secret`` and the whole
+      service-account key in cleartext, on a command CLAUDE.md lists as
+      safe/read-only — ``_is_secret_key("store_routes")`` and
+      ``_is_secret_key("ga4_export")`` are both ``False``, so no mask would
+      apply. Hence ``ga4_export`` joins ``apps``/``test_devices`` in
+      ``nested_fields``.
+    * **A deny-matched key TERMINATES the walk.** ``ga4_export.sa_key`` is a
+      nested TOML table; recursing into it would emit
+      ``ga4_export.sa_key.private_key``, and ``_is_secret_key("private_key")``
+      is ``False`` (the deny set carries ``sa_key``, not a bare ``key``) — so a
+      generic recursion prints the full RSA private key. Mask the container and
+      stop.
+
     The renderer writes to a fresh :class:`Console` so output goes to
     ``sys.stdout``; tests capture via ``CliRunner.invoke``'s output channel.
 
@@ -2586,16 +2845,55 @@ def _render_config_table(cfg: AdingestConfig, reveal: bool = False) -> None:
         """
         table.add_row(Text(key), Text(value))
 
+    def walk(prefix: str, value: Any, leaf_key: str) -> None:
+        """Emit one row per LEAF under ``prefix``; stop at credential-shaped keys.
+
+        ``leaf_key`` is the bare field name :func:`cell` classifies against —
+        it is threaded separately from ``prefix`` because the rendered path
+        (``apps[0].store_routes[0].ga4.api_secret``) is not a key the deny set
+        knows; only its last segment is.
+
+        Ordering inside the dict branch is deliberate: the ``_is_secret_key``
+        test comes FIRST, before the container test, so a credential holding a
+        sub-table is masked whole rather than walked into. See the two rules in
+        the enclosing docstring — a walk that recursed first would print
+        ``ga4_export.sa_key.private_key`` in full.
+        """
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if _is_secret_key(k) or not isinstance(v, dict | list):
+                    row(f"{prefix}.{k}", cell(k, v))
+                else:
+                    walk(f"{prefix}.{k}", v, k)
+        elif isinstance(value, list):
+            for j, item in enumerate(value):
+                if isinstance(item, dict | list):
+                    walk(f"{prefix}[{j}]", item, leaf_key)
+                else:
+                    row(f"{prefix}[{j}]", cell(leaf_key, item))
+        else:
+            row(prefix, cell(leaf_key, value))
+
     console = Console()
     table = Table(show_header=True, header_style="bold")
     table.add_column("Key")
     table.add_column("Value")
 
-    nested_fields = {"apps", "test_devices"}
+    # ``ga4_export`` MUST be listed here. The generic loop below renders every
+    # unlisted field as one ``cell(f.name, value)`` row, and
+    # ``_is_secret_key("ga4_export")`` is False — so an unlisted dict field
+    # emits the whole block stringified in cleartext, ``sa_key`` included.
+    nested_fields = {"apps", "test_devices", "ga4_export"}
     for f in dc_fields(cfg):
         if f.name in nested_fields:
             continue
         row(f.name, cell(f.name, getattr(cfg, f.name)))
+
+    # ``ga4_export`` — nested leaf rows, or nothing at all when unconfigured.
+    # No bare ``ga4_export`` summary row: it would be the cleartext render the
+    # nested walk exists to replace.
+    if cfg.ga4_export:
+        walk("ga4_export", cfg.ga4_export, "ga4_export")
 
     # ``test_devices`` — both counts, then one row per device. The ids are
     # config the operator authored (not credentials), so they render as-is;
@@ -2617,15 +2915,12 @@ def _render_config_table(cfg: AdingestConfig, reveal: bool = False) -> None:
     else:
         row("test_devices", "0 devices, 0 identifiers")
 
-    # ``apps`` last — nested rows per app and per nested sub-table.
+    # ``apps`` last — nested rows per app, to arbitrary depth. ``store_routes``
+    # is a LIST, so the pre-Step-2 one-level walk sent it down the scalar
+    # branch and printed every route's ``ga4.api_secret`` verbatim.
     apps: list[dict[str, Any]] = cfg.apps
     for i, app in enumerate(apps):
-        for k, v in app.items():
-            if isinstance(v, dict):
-                for sub_k, sub_v in v.items():
-                    row(f"apps[{i}].{k}.{sub_k}", cell(sub_k, sub_v))
-            else:
-                row(f"apps[{i}].{k}", cell(k, v))
+        walk(f"apps[{i}]", app, "apps")
 
     console.print(table)
 
