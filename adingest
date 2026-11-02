@@ -43,7 +43,7 @@ from rich.text import Text
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -2251,13 +2251,18 @@ def cli() -> None:
 def ingest(event_date: str, poll: bool, source: str | None, stub: bool, apps_file: str | None,
            project: str | None, url: str | None, token: str | None,
            as_json: bool, quiet: bool) -> None:
-    """POST one ingest for EVENT_DATE (YYYY-MM-DD)."""
+    """POST one ingest for EVENT_DATE (YYYY-MM-DD).
+
+    With --poll, exits 0 only if the job is ``complete``; without it, exit 0 means accepted.
+    """
     cfg = _build_config(project, url, token, apps_file)
     client = AdingestClient(cfg)
     resp = client.post_ingest(event_date, _resolve_source(source, stub), cfg.apps)
     if poll and resp.get("job_id"):
         resp = client.poll_until_terminal(resp["job_id"])
     _emit(resp, as_json, quiet, cfg.test_devices)
+    if poll and resp.get("status") != "complete":
+        sys.exit(1)
 
 
 @cli.command(name="fetch-only")
@@ -2326,7 +2331,10 @@ def range_cmd(
     continue_on_failure: bool, project: str | None, url: str | None, token: str | None,
     as_json: bool, quiet: bool,
 ) -> None:
-    """Fire one ingest per day in START..END (inclusive)."""
+    """Fire one ingest per day in START..END (inclusive).
+
+    With --poll, exits 1 at the end if any day was not ``complete``; without it, exit 0 means accepted.
+    """
     if ".." not in date_range:
         raise click.UsageError("date range must be in form START..END")
     start_s, _, end_s = date_range.partition("..")
@@ -2336,13 +2344,18 @@ def range_cmd(
     cfg = _build_config(project, url, token, apps_file)
     src = _resolve_source(source, stub)
     client = AdingestClient(cfg)
+    any_not_complete = False
     for day in _iter_dates(start, end):
         resp = client.post_ingest(day.isoformat(), src, cfg.apps)
         if poll and resp.get("job_id"):
             resp = client.poll_until_terminal(resp["job_id"])
         _emit(resp, as_json, quiet, cfg.test_devices)
+        if poll and resp.get("status") != "complete":
+            any_not_complete = True
         if resp.get("status") == "failed" and not continue_on_failure:
             sys.exit(1)
+    if any_not_complete:
+        sys.exit(1)
 
 
 @cli.command()

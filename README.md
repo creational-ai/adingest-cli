@@ -279,9 +279,9 @@ Accepts every flag `ingest` accepts, plus:
 
 | Flag | Behavior |
 |------|----------|
-| `--continue-on-failure` | Do not abort on the first `failed` job — fire every day in the range, then exit 1 if any failed |
+| `--continue-on-failure` | Do not abort on the first `failed` job — fire every day in the range, then exit 1 if any polled day was not `complete` |
 
-> Default behavior aborts on the first `failed` job. Use `--continue-on-failure` for unattended backfills where you want all days attempted regardless.
+> Default behavior aborts on the first `failed` job. Use `--continue-on-failure` for unattended backfills where you want all days attempted regardless. Without `--poll` no outcome is seen, so the flag has no effect.
 
 ## `adingest status`
 
@@ -353,7 +353,7 @@ Source: levelplay  fetched=1240  invalid=0  skipped_test=0  verdict=✅ fetch-on
 
 The writer-boundary columns (`skipped_dedup` / `inserted` / `orphan` / `%uid`) and the `GA4:` summary line are omitted in fetch-only mode — they would all read as a misleading `0` in a mode that provably never writes or publishes.
 
-### Exit codes (stricter than `ingest`)
+### Exit codes
 
 | Terminal status | `fetch-only` exit | stdout |
 |---|---|---|
@@ -362,7 +362,7 @@ The writer-boundary columns (`skipped_dedup` / `inserted` / `orphan` / `%uid`) a
 | `failed` (all sources failed) | non-zero | `[]` |
 | non-terminal poll timeout | non-zero | `[]` |
 
-This is deliberately **stricter than `ingest` / `range`**, which exit `0` even on a `failed` job (their alarm is the `🚨` verdict tier in the rendered table, not the exit code). `fetch-only` makes the exit code the alarm so `> rows.json || alert` pipelines work directly. Unifying `ingest`'s exit behavior is out of scope — the divergence is per-verb by design.
+Polled `ingest` and `range` apply the same exit rule (see [Authentication and errors](#authentication-and-errors)); `fetch-only` additionally keeps the surviving rows on stdout, so `> rows.json || alert` pipelines work directly.
 
 > Under `--json --quiet`, a `partial`/`failed` run exits non-zero with **no in-band diagnostic** — the stderr envelope that names the failed source is suppressed. The exit code is the only alarm; re-run without `--quiet` to see which source failed.
 
@@ -409,16 +409,18 @@ Each source gets exactly one verdict per job, plus per-`(platform, app_id)` verd
 >
 > ⚠ **`silent-drop`'s two limbs behave differently in fetch-only mode, and the split is deliberate.** The **arithmetic** limb (cause (a) above) stays **suppressed**: it would false-positive on *every* successful fetch-only run, since `rows_inserted == 0` by construction. The **state-driven** limb (cause (b), `store_resolution_state == "failed"`) **evaluates in both modes**, because the store resolver runs *pre*-sink — including on the fetch-only path. Without it a fail-closed run renders a green `✅ fetch-only` while having produced nothing, on the exact rehearsal the store rollout depends on.
 
-`--json` emits the same verdicts under `sources[<src>].verdicts: [...]` and `sources[<src>].by_app_platform[<key>].verdicts: [...]`. Pipe into `jq` for cron alerting — anything not in the healthy set is an alert:
+`--json` emits the same verdicts under `sources[<src>].verdicts: [...]` and `sources[<src>].by_app_platform[<key>].verdicts: [...]`. For cron alerting, save the JSON to a file and run `jq` on it — anything not in the healthy set is an alert:
 
 ```bash
-adingest ingest "$(date -u -v-1d +%F)" --poll --json \
-  | jq -e '[.sources[].verdicts[]] - ["healthy-fresh", "healthy-dedup", "fetch-only"] | length > 0' \
+adingest ingest "$(date -u -v-1d +%F)" --poll --json > out.json || echo "ALERT: job not complete — page oncall"
+jq -e '[.sources[].verdicts[]] - ["healthy-fresh", "healthy-dedup", "fetch-only"] | length > 0' out.json \
   > /dev/null \
   && echo "ALERT: non-healthy verdict — page oncall"
 ```
 
-> `fetch-only` is in the healthy set so the *same* recipe works whether it polls an `ingest` or a `fetch-only` job — without it, every successful fetch-only run would false-page. One channel difference: for a `fetch-only` job the verdict envelope rides **stderr** (stdout is rows-only), so feed the recipe the envelope stream — `adingest fetch-only … --json 2>&1 >/dev/null | jq -e …`.
+> Do not pipe into `jq`: a pipe discards the CLI's exit code, and an adapter-failed job has no verdicts, so the `jq` check alone passes it silently.
+
+> `fetch-only` is in the healthy set, so the same `jq` check works for a `fetch-only` job too. Stdout there is rows-only and the verdict envelope rides **stderr**, so use: `adingest fetch-only … --json 2> envelope.json > rows.json || echo ALERT`, then the same `jq` check on `envelope.json`.
 
 ## `adingest upgrade`
 
@@ -473,8 +475,10 @@ Error: HTTP 401 POST /v1/ — Bearer token does not match the expected value.
 
 | Exit | Meaning |
 |------|---------|
-| 0 | Job reached a terminal status (`complete` / `partial` / `failed`); table rendered with verdict tier |
-| 1 | HTTP error (non-2xx, network failure, auth mismatch) rendered as `Error: …`; or `range` saw a `failed` job and `--continue-on-failure` was not set |
+| 0 | With `--poll`, every job finished `complete`; without `--poll`, the jobs were accepted |
+| 1 | HTTP error (non-2xx, network failure, auth mismatch) rendered as `Error: …`; or, with `--poll`, a job was not `complete` (`partial`, `failed` or poll timeout); or `range` saw a `failed` job and `--continue-on-failure` was not set |
+
+The exit table applies to `ingest` and `range`; `status` follows no such rule. Exit 1 does not mean nothing landed — check `adingest status <job_id>` before re-firing.
 
 | HTTP | Trigger |
 |------|---------|
