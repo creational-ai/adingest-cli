@@ -437,19 +437,18 @@ When a newer version is available:
 ```bash
 $ adingest upgrade
 Resolving server at https://api.creational.ai/adingest...
-Server recommends 0.3.0; you are at 0.2.2
+Upgrading 0.2.2 -> 0.3.0
 Fetching https://raw.githubusercontent.com/creational-ai/adingest-cli/abc123.../adingest
-Verifying sha256... ok
-Replacing /home/user/.local/bin/adingest...
-Upgraded 0.2.2 -> 0.3.0
+sha256 verified (0123456789ab...)
+Upgraded 0.2.2 -> 0.3.0 (installed at /home/user/.local/share/adingest/adingest)
 ```
 
 The flow:
 
 1. `GET <url>/v1/cli/version` with Bearer — returns `{product, server_version, cli_recommended, cli_min_compatible, download_url, cli_sha256}`
 2. Abort if `manifest.product != "adingest"` — defends against pointing the CLI at a different Creational product's server
-3. Compare `__version__` to `cli_recommended` / `cli_min_compatible`; pick one of four verdicts (equal / local-newer / local-older-compatible / local-older-required)
-4. For `older-required`: fetch `download_url` (commit-SHA-pinned, no auth needed since the repo is public), sha256-verify against `cli_sha256`, `chmod +x`, atomic-`mv` into place
+3. Compare `__version__` to `cli_recommended`; pick one of three verdicts (equal / local-newer / older). Any local < `cli_recommended` installs it; `cli_min_compatible` only labels the message ("below floor X")
+4. For `older`: fetch `download_url` (commit-SHA-pinned, no auth needed since the repo is public), sha256-verify against `cli_sha256`, `chmod +x`, atomic-`mv` into place
 
 > `download_url` is pinned to a commit SHA (40-char hex), not a tag. Mirror tag-moves cannot redirect to different bytes. `cli_sha256` is belt-and-suspenders — if the bytes don't match, the CLI refuses to replace itself.
 

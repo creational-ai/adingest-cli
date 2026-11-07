@@ -43,7 +43,7 @@ from rich.text import Text
 #: into the installed copy at ``~/.local/share/adingest/adingest``; the dev
 #: tree always carries ``0.0.0-dev`` so ``--version`` is unambiguous about
 #: which copy is running.
-__version__ = "0.2.10"
+__version__ = "0.2.11"
 
 #: Product identity literal — hardcoded, NEVER overridden by ``/deploy`` or
 #: env. Step 4's ``upgrade`` subcommand compares this against the service
@@ -1755,10 +1755,10 @@ def _merge_verdicts_into_response(response: dict[str, Any]) -> dict[str, Any]:
 # --- Upgrade flow -----------------------------------------------------------
 
 
-#: Verdict slug emitted by :meth:`UpgradeFlow.compute_verdict` — one of four
-#: branches. Only ``"older-required"`` proceeds past step 4 of the 9-step flow;
-#: the other three exit cleanly at step 4 with an informational message.
-UpgradeVerdict = Literal["equal", "local-newer", "older-compatible", "older-required"]
+#: Verdict slug emitted by :meth:`UpgradeFlow.compute_verdict` — one of three
+#: branches. Only ``"older"`` proceeds past step 4 of the 9-step flow; the other
+#: two exit cleanly at step 4 with an informational message.
+UpgradeVerdict = Literal["equal", "local-newer", "older"]
 
 
 @dataclass(frozen=True)
@@ -1815,7 +1815,7 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     """Parse a dotted X.Y.Z version into a comparable int-tuple.
 
     ``"0.0.0-dev"`` strips the ``-dev`` suffix → ``(0, 0, 0)``. The placeholder
-    must always compare ``older-required`` against any real release because
+    must always compare ``older`` against any real release because
     ``-dev`` is the dev-tree seed Phase 1a bakes into the installed copy. Any
     non-numeric component after stripping ``-dev`` raises
     :class:`click.ClickException` so a malformed manifest never silently
@@ -1842,16 +1842,16 @@ class UpgradeFlow:
     3. Verify ``manifest.product`` matches the bundled :data:`PRODUCT` literal;
        mismatch → ABORT (operator pointed at the wrong product's server)
     4. Compute verdict by comparing local :data:`__version__` to
-       ``manifest.cli_recommended`` (four branches; see :class:`UpgradeVerdict`)
-    5. (older-required only) ``GET manifest.download_url`` over HTTPS
+       ``manifest.cli_recommended`` (three branches; see :class:`UpgradeVerdict`)
+    5. (older only) ``GET manifest.download_url`` over HTTPS
        (commit-SHA-pinned; no Bearer — GitHub raw is public)
-    6. (older-required only) Compute sha256 of fetched body; compare to
+    6. (older only) Compute sha256 of fetched body; compare to
        ``manifest.cli_sha256``; mismatch → ABORT
-    7. (older-required only) Write to ``<install_dir>/adingest.tmp``;
+    7. (older only) Write to ``<install_dir>/adingest.tmp``;
        ``chmod +x``
-    8. (older-required only) Atomic :func:`os.replace` to target;
+    8. (older only) Atomic :func:`os.replace` to target;
        update ``<install_dir>/VERSION``
-    9. (older-required only) Print success; exit 0
+    9. (older only) Print success; exit 0
 
     The class is dependency-injectable for tests: ``install_dir`` parameterizes
     the filesystem operations (use ``tmp_path`` in tests); the manifest fetch
@@ -1928,25 +1928,19 @@ class UpgradeFlow:
     def compute_verdict(self, manifest: CliVersionManifest) -> UpgradeVerdict:
         """Compare local ``__version__`` to ``manifest.cli_recommended``.
 
-        Four branches:
+        Three branches; ``cli_min_compatible`` does not decide the action:
 
         - **equal**: local == recommended → "Already at X.Y.Z"
         - **local-newer**: local > recommended → "Server expects X.Y.Z"
-        - **older-compatible**: local < recommended AND local >= min_compatible →
-          informational nag; current still works
-        - **older-required**: local < min_compatible → proceeds to steps 5-9
+        - **older**: local < recommended → proceeds to steps 5-9
         """
         local = _version_tuple(__version__)
         recommended = _version_tuple(manifest.cli_recommended)
-        floor = _version_tuple(manifest.cli_min_compatible)
         if local == recommended:
             return "equal"
         if local > recommended:
             return "local-newer"
-        # local < recommended below.
-        if local >= floor:
-            return "older-compatible"
-        return "older-required"
+        return "older"
 
     # --- Step 5: fetch bytes -----------------------------------------------
 
@@ -2025,17 +2019,12 @@ class UpgradeFlow:
                 f"Server expects {manifest.cli_recommended} (local {__version__})"
             )
             return
-        if verdict == "older-compatible":
-            click.echo(
-                f"Upgrade available: {__version__} -> {manifest.cli_recommended}; "
-                f"current works (floor={manifest.cli_min_compatible})"
-            )
-            return
-        # older-required → proceed to steps 5-9.
-        click.echo(
-            f"Required upgrade: {__version__} -> {manifest.cli_recommended} "
-            f"(below floor {manifest.cli_min_compatible})"
+        # older → proceed to steps 5-9.
+        below_floor = _version_tuple(__version__) < _version_tuple(
+            manifest.cli_min_compatible
         )
+        suffix = f" (below floor {manifest.cli_min_compatible})" if below_floor else ""
+        click.echo(f"Upgrading {__version__} -> {manifest.cli_recommended}{suffix}")
         # Step 5: fetch bytes.
         click.echo(f"Fetching {manifest.download_url}...")
         body = self.fetch_bytes(manifest.download_url)
@@ -2378,7 +2367,7 @@ def upgrade(project: str | None, url: str | None, token: str | None) -> None:
 
     Drives the 9-step universal upgrade flow (see :class:`UpgradeFlow`):
     fetches ``/v1/cli/version`` manifest, verifies product identity, computes
-    a verdict, and (for older-required) fetches commit-SHA-pinned bytes from
+    a verdict, and (for older) fetches commit-SHA-pinned bytes from
     the public mirror, sha256-verifies, and atomically replaces the installed
     copy.
 
